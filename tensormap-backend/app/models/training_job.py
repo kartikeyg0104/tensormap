@@ -61,7 +61,3 @@ class TrainingJob(SQLModel, table=True):
     started_at: datetime | None = Field(default=None, sa_column=Column(DateTime, nullable=True))
     completed_at: datetime | None = Field(default=None, sa_column=Column(DateTime, nullable=True))
     error_message: str | None = Field(default=None, max_length=2000, nullable=True)
-    # Forward-looking columns reserved for later phases (analysis + tuning).
-    analysis_cache: dict | None = Field(default=None, sa_column=Column(JSON, nullable=True))
-    last_export_download_at: datetime | None = Field(default=None, sa_column=Column(DateTime, nullable=True))
-    tuning_session_id: str | None = Field(default=None, max_length=36, nullable=True)

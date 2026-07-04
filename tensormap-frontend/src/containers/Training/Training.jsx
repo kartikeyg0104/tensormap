@@ -24,6 +24,7 @@ import {
 import logger from "../../shared/logger";
 import FeedbackDialog from "../../components/shared/FeedbackDialog";
 import Result from "../../components/ResultPanel/Result/Result";
+import TrainingMetricsChart from "@/components/training/TrainingMetricsChart";
 import {
   download_code,
   runModel,
@@ -34,9 +35,6 @@ import {
 import { getAllFiles } from "../../services/FileServices";
 import {
   getTrainingSocket,
-  subscribeToJob,
-  unsubscribeFromJob,
-  cancelJob,
 } from "../../services/socketService";
 import {
   models as modelListAtom,
@@ -62,31 +60,12 @@ const problemTypeOptions = [
   { key: "prob_type_2", label: "Linear Regression", value: "2" },
 ];
 
-const fmt = (value) => (typeof value === "number" ? value.toFixed(4) : value);
-
-// Render one epoch's structured metrics as a single human-readable line.
-const formatMetricLine = (m) => {
-  const parts = [`loss: ${fmt(m.loss)}`];
-  if (m.accuracy != null) parts.push(`accuracy: ${fmt(m.accuracy)}`);
-  if (m.val_loss != null) parts.push(`val_loss: ${fmt(m.val_loss)}`);
-  if (m.val_accuracy != null) parts.push(`val_accuracy: ${fmt(m.val_accuracy)}`);
-  return `Epoch ${m.epoch} — ${parts.join(", ")}`;
-};
-
-const statusLine = (status, error) => {
-  if (status === "completed") return "Training completed.";
-  if (status === "cancelled") return "Training cancelled.";
-  if (status === "failed") return `Training failed${error ? `: ${error}` : "."}`;
-  return `Status: ${status}`;
-};
-
-const TERMINAL_STATUSES = ["completed", "failed", "cancelled"];
-
 export default function Training() {
   const { projectId } = useParams();
   const [, setModelList] = useRecoilState(modelListAtom);
 
   const [selectedModel, setSelectedModel] = useState(null);
+  const [activeJobId, setActiveJobId] = useState(null);
   const [resultValues, setResultValues] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isHistoryLoading, setIsHistoryLoading] = useState(true);
@@ -102,10 +81,6 @@ export default function Training() {
   const fetchModelsRef = useRef(null);
   const fetchIdRef = useRef(0);
   const fetchFilesIdRef = useRef(0);
-  // Active training job + its Socket.IO listener cleanup.
-  const currentJobIdRef = useRef(null);
-  const jobCleanupRef = useRef(null);
-  const [cancelRequested, setCancelRequested] = useState(false);
   const [trainingHistory, setTrainingHistory] = useRecoilState(trainingHistoryAtom);
 
   // Training config state
@@ -217,15 +192,6 @@ export default function Training() {
       socket.off("connect", onConnect);
       socket.off("connect_error", onConnectError);
       socket.off("disconnect", onDisconnect);
-      // Detach any active job listener and leave its room.
-      if (jobCleanupRef.current) {
-        jobCleanupRef.current();
-        jobCleanupRef.current = null;
-      }
-      if (currentJobIdRef.current) {
-        unsubscribeFromJob(currentJobIdRef.current);
-        currentJobIdRef.current = null;
-      }
       socket.disconnect();
     };
   }, [projectId, fetchModels, fetchFiles, setModelList]);
@@ -479,47 +445,6 @@ export default function Training() {
     }
   }, [selectedModel, projectId]);
 
-  // Tear down an active job: stop the timeout, detach the socket listener,
-  // leave the room, and refresh history.
-  const finishTraining = useCallback(() => {
-    clearTimeout(timeoutRef.current);
-    setIsLoading(false);
-    setCancelRequested(false);
-    if (jobCleanupRef.current) {
-      jobCleanupRef.current();
-      jobCleanupRef.current = null;
-    }
-    if (currentJobIdRef.current) {
-      unsubscribeFromJob(currentJobIdRef.current);
-      currentJobIdRef.current = null;
-    }
-    if (fetchModelsRef.current) {
-      fetchModelsRef.current();
-    }
-  }, []);
-
-  // Handle a structured event from the subscribed job's room.
-  const handleJobEvent = useCallback(
-    (data) => {
-      clearTimeout(timeoutRef.current);
-      if (data.type === "catchup") {
-        setResultValues((data.metrics || []).map(formatMetricLine));
-        if (TERMINAL_STATUSES.includes(data.status)) {
-          setResultValues((prev) => [...prev, statusLine(data.status)]);
-          finishTraining();
-        } else {
-          setIsLoading(true);
-        }
-      } else if (data.type === "metrics") {
-        setResultValues((prev) => [...prev, formatMetricLine(data)]);
-      } else if (data.type === "status") {
-        setResultValues((prev) => [...prev, statusLine(data.status, data.error)]);
-        finishTraining();
-      }
-    },
-    [finishTraining],
-  );
-
   const handleRun = useCallback(() => {
     if (!selectedModel) return;
 
@@ -533,20 +458,22 @@ export default function Training() {
       ]);
       return;
     }
+    
     setResultValues([]);
     setIsLoading(true);
-    setCancelRequested(false);
+    setActiveJobId(null);
+    
     timeoutRef.current = setTimeout(() => {
       setIsLoading(false);
+      setActiveJobId(null);
       setResultValues(["Training timed out. The model may still be running on the server."]);
     }, 300000);
+    
     runModel(selectedModel, projectId)
       .then((job) => {
-        currentJobIdRef.current = job.job_id;
-        if (jobCleanupRef.current) {
-          jobCleanupRef.current();
-        }
-        jobCleanupRef.current = subscribeToJob(job.job_id, handleJobEvent);
+        clearTimeout(timeoutRef.current);
+        setActiveJobId(job.job_id);
+        setIsLoading(false);
       })
       .catch((error) => {
         clearTimeout(timeoutRef.current);
@@ -560,24 +487,14 @@ export default function Training() {
           "An error occurred";
         setResultValues([message]);
         setIsLoading(false);
+        setActiveJobId(null);
       });
-  }, [selectedModel, projectId, validateAllFields, handleJobEvent]);
-
-  // Request cancellation of the running job. The server stops training at the
-  // next epoch boundary and emits a terminal status event.
-  const handleStop = useCallback(() => {
-    const jobId = currentJobIdRef.current;
-    if (!jobId) return;
-    setCancelRequested(true);
-    cancelJob(jobId).catch((error) => {
-      logger.error("Failed to cancel training:", error);
-      setCancelRequested(false);
-    });
-  }, []);
+  }, [selectedModel, projectId, validateAllFields]);
 
   const handleClear = () => {
     setResultValues([]);
     setIsLoading(false);
+    setActiveJobId(null);
   };
 
   const handleDeleteClick = (model, e) => {
@@ -707,16 +624,11 @@ export default function Training() {
               onClick={handleRun}
               disabled={!selectedModel || !configSaved || isLoading || hasValidationErrors()}
             >
-              {isLoading ? "Training..." : "Train"}
+              {isLoading ? "Starting..." : "Train"}
             </Button>
-            {isLoading && (
-              <Button variant="destructive" onClick={handleStop} disabled={cancelRequested}>
-                {cancelRequested ? "Cancellation requested..." : "Stop Training"}
-              </Button>
-            )}
             <Button
               onClick={handleClear}
-              disabled={resultValues.length === 0 && !isLoading}
+              disabled={resultValues.length === 0 && !activeJobId && !isLoading}
               variant="secondary"
             >
               Clear
@@ -949,15 +861,24 @@ export default function Training() {
         </div>
       )}
 
-      {isLoading && resultValues.length === 0 && (
+      {isLoading && !activeJobId && (
         <Card>
           <CardContent className="flex items-center justify-center py-16 text-muted-foreground">
-            Model is running, please wait...
+            Starting training, please wait...
           </CardContent>
         </Card>
       )}
 
-      {resultValues.length > 0 && (
+      {/* NEW: Live Training Metrics Chart */}
+      {activeJobId && (
+        <TrainingMetricsChart 
+          jobId={activeJobId}
+          totalEpochs={Number(trainingConfig.epochs) || 0}
+        />
+      )}
+
+      {/* Legacy text output for errors */}
+      {!activeJobId && resultValues.length > 0 && (
         <div className="space-y-2">
           {resultValues.map((item, index) => (
             <Result result={item} key={index} />
