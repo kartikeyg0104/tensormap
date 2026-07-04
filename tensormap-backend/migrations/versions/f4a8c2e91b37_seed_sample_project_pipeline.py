@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import shutil
+import uuid
 
 import sqlalchemy as sa
 from alembic import op
@@ -22,7 +23,7 @@ depends_on = None
 
 log = logging.getLogger(__name__)
 
-# Fixed UUIDs for idempotency
+# Fixed UUIDs for idempotency (canonical hyphenated form; encoded per-dialect at bind time)
 PROJECT_UUID = "00000000-0000-4000-a000-000000000001"
 FILE_UUID = "00000000-0000-4000-a000-000000000002"
 
@@ -34,8 +35,23 @@ TARGET_CSV = os.path.join(DATA_DIR, "iris_sample.csv")
 MODEL_JSON_PATH = os.path.join(MODEL_DIR, "iris-classifier.json")
 
 
+def _uid(value: str, is_sqlite: bool) -> str:
+    """Encode a canonical hyphenated UUID string for the active dialect.
+
+    sa.UUID() stores native UUID on PostgreSQL but falls back to 32-char
+    hex-without-dashes on SQLite, which is what the ORM binds/compares
+    against for every id-based lookup. Fixed seed UUIDs must match that
+    format on SQLite or they become unreachable by id.
+    """
+    return uuid.UUID(value).hex if is_sqlite else value
+
+
 def upgrade():
     bind = op.get_bind()
+    is_sqlite = bind.dialect.name == "sqlite"
+
+    project_id = _uid(PROJECT_UUID, is_sqlite)
+    file_id = _uid(FILE_UUID, is_sqlite)
 
     # 1. Remove old bare "Sample Project" if it has no associated files or models
     bind.execute(
@@ -54,7 +70,7 @@ def upgrade():
             VALUES (:id, :name, :desc)
             ON CONFLICT (id) DO NOTHING
         """),
-        {"id": PROJECT_UUID, "name": "Iris Sample Project", "desc": "Pre-configured Iris classification pipeline"},
+        {"id": project_id, "name": "Iris Sample Project", "desc": "Pre-configured Iris classification pipeline"},
     )
 
     # 3. Copy CSV dataset
@@ -68,7 +84,7 @@ def upgrade():
             VALUES (:id, :name, :type, :proj)
             ON CONFLICT (id) DO NOTHING
         """),
-        {"id": FILE_UUID, "name": "iris_sample", "type": "csv", "proj": PROJECT_UUID},
+        {"id": file_id, "name": "iris_sample", "type": "csv", "proj": project_id},
     )
 
     # 5. Insert data_process (target field assignment)
@@ -78,7 +94,7 @@ def upgrade():
             SELECT :target, :fid
             WHERE NOT EXISTS (SELECT 1 FROM data_process WHERE file_id = :fid)
         """),
-        {"target": "species", "fid": FILE_UUID},
+        {"target": "species", "fid": file_id},
     )
 
     # 6. Insert model_basic with full training config
@@ -92,8 +108,8 @@ def upgrade():
         """),
         {
             "name": "iris-classifier",
-            "fid": FILE_UUID,
-            "pid": PROJECT_UUID,
+            "fid": file_id,
+            "pid": project_id,
             "mtype": 1,  # ProblemType.CLASSIFICATION
             "target": "species",
             "split": 80.0,
@@ -137,6 +153,10 @@ def upgrade():
 
 def downgrade():
     bind = op.get_bind()
+    is_sqlite = bind.dialect.name == "sqlite"
+
+    project_id = _uid(PROJECT_UUID, is_sqlite)
+    file_id = _uid(FILE_UUID, is_sqlite)
 
     # Delete seed data in reverse dependency order
     bind.execute(
@@ -147,23 +167,35 @@ def downgrade():
         """)
     )
     bind.execute(sa.text("DELETE FROM model_basic WHERE model_name = 'iris-classifier'"))
-    bind.execute(sa.text("DELETE FROM data_process WHERE file_id = :fid"), {"fid": FILE_UUID})
-    bind.execute(sa.text("DELETE FROM data_file WHERE id = :id"), {"id": FILE_UUID})
-    bind.execute(sa.text("DELETE FROM project WHERE id = :id"), {"id": PROJECT_UUID})
+    bind.execute(sa.text("DELETE FROM data_process WHERE file_id = :fid"), {"fid": file_id})
+    bind.execute(sa.text("DELETE FROM data_file WHERE id = :id"), {"id": file_id})
+    bind.execute(sa.text("DELETE FROM project WHERE id = :id"), {"id": project_id})
 
     # Remove generated files
     for path in [TARGET_CSV, MODEL_JSON_PATH]:
         if os.path.exists(path):
             os.remove(path)
 
-    # Re-seed the original bare "Sample Project" (only if none exists)
-    bind.execute(
-        sa.text("""
-            INSERT INTO project (id, name, description)
-            SELECT gen_random_uuid(), 'Sample Project', 'A sample project to get started with TensorMap'
-            WHERE NOT EXISTS (SELECT 1 FROM project WHERE name = 'Sample Project')
-        """)
-    )
+    # Re-seed the original bare "Sample Project" (only if none exists).
+    # gen_random_uuid() is PostgreSQL-only; SQLite needs a client-generated id
+    # encoded in the same hex format used everywhere else in this file.
+    if is_sqlite:
+        bind.execute(
+            sa.text("""
+                INSERT INTO project (id, name, description)
+                SELECT :id, 'Sample Project', 'A sample project to get started with TensorMap'
+                WHERE NOT EXISTS (SELECT 1 FROM project WHERE name = 'Sample Project')
+            """),
+            {"id": uuid.uuid4().hex},
+        )
+    else:
+        bind.execute(
+            sa.text("""
+                INSERT INTO project (id, name, description)
+                SELECT gen_random_uuid(), 'Sample Project', 'A sample project to get started with TensorMap'
+                WHERE NOT EXISTS (SELECT 1 FROM project WHERE name = 'Sample Project')
+            """)
+        )
 
 
 def _build_model_configs():

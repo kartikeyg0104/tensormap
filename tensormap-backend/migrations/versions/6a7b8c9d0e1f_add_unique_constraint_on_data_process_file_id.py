@@ -16,6 +16,9 @@ depends_on = None
 
 
 def upgrade():
+    bind = op.get_bind()
+    is_postgres = bind.dialect.name == "postgresql"
+
     # Deduplicate before adding constraint: keep the most recently updated
     # row per file_id (NULLS LAST so rows with NULL updated_on are deprioritised).
     op.execute(
@@ -35,14 +38,29 @@ def upgrade():
         """
     )
 
-    # The model previously used index=True on file_id, which created a
-    # non-unique index.  The unique constraint below creates its own
-    # btree index, so drop the redundant old one.
-    op.drop_index("ix_data_process_file_id", table_name="data_process")
-
-    op.create_unique_constraint("uq_data_process_file_id", "data_process", ["file_id"])
+    # SQLite cannot ALTER a table to add/drop constraints or indexes directly;
+    # it requires batch mode (copy-and-move strategy). PostgreSQL supports
+    # these operations directly.
+    if is_postgres:
+        # The model previously used index=True on file_id, which created a
+        # non-unique index. The unique constraint below creates its own
+        # btree index, so drop the redundant old one.
+        op.drop_index("ix_data_process_file_id", table_name="data_process")
+        op.create_unique_constraint("uq_data_process_file_id", "data_process", ["file_id"])
+    else:
+        with op.batch_alter_table("data_process") as batch_op:
+            batch_op.drop_index("ix_data_process_file_id")
+            batch_op.create_unique_constraint("uq_data_process_file_id", ["file_id"])
 
 
 def downgrade():
-    op.drop_constraint("uq_data_process_file_id", "data_process", type_="unique")
-    op.create_index("ix_data_process_file_id", "data_process", ["file_id"], unique=False)
+    bind = op.get_bind()
+    is_postgres = bind.dialect.name == "postgresql"
+
+    if is_postgres:
+        op.drop_constraint("uq_data_process_file_id", "data_process", type_="unique")
+        op.create_index("ix_data_process_file_id", "data_process", ["file_id"], unique=False)
+    else:
+        with op.batch_alter_table("data_process") as batch_op:
+            batch_op.drop_constraint("uq_data_process_file_id", type_="unique")
+            batch_op.create_index("ix_data_process_file_id", ["file_id"], unique=False)
