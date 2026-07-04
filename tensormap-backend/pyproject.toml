@@ -57,6 +57,7 @@ packages = ["app"]
 asyncio_mode = "auto"
 markers = [
     "slow: end-to-end tests that train a real Keras model (deselect with '-m \"not slow\"')",
+    "integration: integration tests that require database and Socket.IO (deselect with '-m \"not integration\"')",
 ]
 
 [build-system]

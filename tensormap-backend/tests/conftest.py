@@ -22,6 +22,7 @@ from collections.abc import Generator
 
 import pytest
 from fastapi.testclient import TestClient
+from socketio import SimpleClient
 from sqlmodel import Session, SQLModel, create_engine
 from sqlmodel.pool import StaticPool
 
@@ -131,3 +132,21 @@ def client(db_session: Session) -> Generator[TestClient, None, None]:
 
     # Clean up dependency override
     app.dependency_overrides.clear()
+
+
+@pytest.fixture(scope="function")
+def socketio_test_client() -> Generator[SimpleClient, None, None]:
+    """
+    Provide a Socket.IO test client for integration tests.
+
+    Yields:
+        SimpleClient: python-socketio test client for Socket.IO testing
+    """
+    from app.shared.constants import SOCKETIO_DL_NAMESPACE
+
+    client = SimpleClient()
+    client.connect("http://localhost:4300", namespace=SOCKETIO_DL_NAMESPACE)
+
+    yield client
+
+    client.disconnect()
