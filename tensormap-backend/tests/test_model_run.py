@@ -3,7 +3,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from app.services.deep_learning import get_code_service, run_code_service
-from app.services.model_run import model_run
+from app.services.model_run import ModelRunError, _helper_generate_file_location, model_run
 from app.shared.enums import ProblemType
 
 
@@ -116,3 +116,38 @@ class TestGetCodeServiceOnFailure:
 
         assert result["success"] is False
         assert result["message"] == "file missing"
+
+
+class TestHelperGenerateFileLocation:
+    def test_returns_path_with_disk_name(self):
+        mock_file = MagicMock()
+        mock_file.disk_name = "my_data_a1b2c3d4.csv"
+        mock_file.file_type = "csv"
+        db = MagicMock()
+        db.exec.return_value.first.return_value = mock_file
+
+        with patch("app.services.model_run.get_settings") as mock_settings:
+            mock_settings.return_value.upload_folder = "/uploads"
+            result = _helper_generate_file_location(db, file_id="some-uuid")
+
+        assert result == "/uploads/my_data_a1b2c3d4.csv"
+
+    def test_returns_path_for_zip_without_extension(self):
+        mock_file = MagicMock()
+        mock_file.disk_name = "images_a1b2c3d4.zip"
+        mock_file.file_type = "zip"
+        db = MagicMock()
+        db.exec.return_value.first.return_value = mock_file
+
+        with patch("app.services.model_run.get_settings") as mock_settings:
+            mock_settings.return_value.upload_folder = "/uploads"
+            result = _helper_generate_file_location(db, file_id="some-uuid")
+
+        assert result == "/uploads/images_a1b2c3d4"
+
+    def test_raises_error_when_file_not_found(self):
+        db = MagicMock()
+        db.exec.return_value.first.return_value = None
+
+        with pytest.raises(ModelRunError, match="Dataset file not found"):
+            _helper_generate_file_location(db, file_id="missing-uuid")
