@@ -4,7 +4,7 @@
  * @module
  */
 
-import { useMemo } from "react";
+import { useMemo, useEffect } from "react";
 import { useTrainingMetrics } from "@/hooks/useTrainingMetrics";
 import TrainingHeader from "./TrainingHeader";
 import LossChart from "./LossChart";
@@ -12,9 +12,20 @@ import AccuracyChart from "./AccuracyChart";
 import MetricsSummaryBar from "./MetricsSummaryBar";
 import { TrainingMetricsChartProps } from "@/types/training";
 
-export default function TrainingMetricsChart({ jobId, totalEpochs }: TrainingMetricsChartProps) {
-  const { metrics, status, currentEpoch, cancel, cancelRequested, startedAt, error } =
+export default function TrainingMetricsChart({
+  jobId,
+  totalEpochs,
+  onComplete,
+}: TrainingMetricsChartProps) {
+  const { metrics, status, currentEpoch, cancel, cancelRequested, startedAt, error, isCompleted } =
     useTrainingMetrics(jobId, totalEpochs);
+
+  // Call onComplete when training finishes
+  useEffect(() => {
+    if (isCompleted && onComplete) {
+      onComplete(jobId);
+    }
+  }, [isCompleted, jobId, onComplete]);
 
   // Calculate elapsed time
   const elapsedTime = useMemo(() => {

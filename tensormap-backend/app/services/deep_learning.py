@@ -679,6 +679,18 @@ def delete_model_service(db: Session, model_id: int) -> tuple:
         return _resp(404, False, "Model not found")
 
     model_name = model.model_name
+
+    # Delete all exports for this model's training jobs
+    try:
+        from app.services.model_export import delete_model_exports
+
+        deleted_count = delete_model_exports(model_id, db)
+        if deleted_count > 0:
+            logger.info(f"Deleted {deleted_count} export directories for model {model_id}")
+    except Exception as e:
+        logger.warning(f"Failed to delete exports for model {model_id}: {e}")
+        # Continue with model deletion even if export cleanup fails
+
     try:
         db.delete(model)
         db.commit()

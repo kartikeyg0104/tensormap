@@ -24,6 +24,7 @@ export interface TrainingState {
 export interface TrainingMetricsChartProps {
   jobId: string;
   totalEpochs: number;
+  onComplete?: (jobId: string) => void;
 }
 
 export interface TrainingHeaderProps {
