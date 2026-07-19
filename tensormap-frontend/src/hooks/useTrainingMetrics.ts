@@ -32,6 +32,7 @@ interface UseTrainingMetricsReturn {
   cancelRequested: boolean;
   startedAt: string | null;
   error: string | null;
+  isCompleted: boolean;
 }
 
 export function useTrainingMetrics(
@@ -182,5 +183,6 @@ export function useTrainingMetrics(
     cancelRequested,
     startedAt,
     error,
+    isCompleted: status === "completed",
   };
 }

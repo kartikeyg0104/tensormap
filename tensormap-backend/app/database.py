@@ -1,6 +1,7 @@
 """Database engine and session dependency for FastAPI."""
 
 from collections.abc import Generator
+from contextlib import contextmanager
 
 from sqlmodel import Session, create_engine
 
@@ -27,5 +28,12 @@ engine = _build_engine()
 
 def get_db() -> Generator[Session, None, None]:
     """Yield a SQLModel session and close it when the request finishes."""
+    with Session(engine) as session:
+        yield session
+
+
+@contextmanager
+def get_session() -> Generator[Session, None, None]:
+    """Context manager for getting a database session outside of FastAPI requests."""
     with Session(engine) as session:
         yield session

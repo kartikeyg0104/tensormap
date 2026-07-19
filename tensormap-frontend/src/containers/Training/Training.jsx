@@ -25,6 +25,7 @@ import logger from "../../shared/logger";
 import FeedbackDialog from "../../components/shared/FeedbackDialog";
 import Result from "../../components/ResultPanel/Result/Result";
 import TrainingMetricsChart from "@/components/training/TrainingMetricsChart";
+import ExportPanel from "@/components/export/ExportPanel";
 import {
   download_code,
   runModel,
@@ -64,6 +65,7 @@ export default function Training() {
 
   const [selectedModel, setSelectedModel] = useState(null);
   const [activeJobId, setActiveJobId] = useState(null);
+  const [completedJobInfo, setCompletedJobInfo] = useState(null); // { jobId, modelName }
   const [resultValues, setResultValues] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isHistoryLoading, setIsHistoryLoading] = useState(true);
@@ -460,6 +462,7 @@ export default function Training() {
     setResultValues([]);
     setIsLoading(true);
     setActiveJobId(null);
+    setCompletedJobInfo(null); // Clear previous completed job
 
     timeoutRef.current = setTimeout(() => {
       setIsLoading(false);
@@ -493,6 +496,7 @@ export default function Training() {
     setResultValues([]);
     setIsLoading(false);
     setActiveJobId(null);
+    setCompletedJobInfo(null); // Also clear completed job info
   };
 
   const handleDeleteClick = (model, e) => {
@@ -626,7 +630,9 @@ export default function Training() {
             </Button>
             <Button
               onClick={handleClear}
-              disabled={resultValues.length === 0 && !activeJobId && !isLoading}
+              disabled={
+                resultValues.length === 0 && !activeJobId && !completedJobInfo && !isLoading
+              }
               variant="secondary"
             >
               Clear
@@ -872,7 +878,17 @@ export default function Training() {
         <TrainingMetricsChart
           jobId={activeJobId}
           totalEpochs={Number(trainingConfig.epochs) || 0}
+          onComplete={(jobId) => {
+            // When training completes, show export panel
+            setCompletedJobInfo({ jobId, modelName: selectedModel });
+            setActiveJobId(null); // Hide the live chart
+          }}
         />
+      )}
+
+      {/* NEW: Export Panel (shown when training completes) */}
+      {completedJobInfo && (
+        <ExportPanel jobId={completedJobInfo.jobId} modelName={completedJobInfo.modelName} />
       )}
 
       {/* Legacy text output for errors */}

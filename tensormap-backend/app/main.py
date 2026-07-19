@@ -22,7 +22,7 @@ from app.exceptions import (
     validation_exception_handler,
 )
 from app.middleware import RequestIDMiddleware, RequestLoggingMiddleware
-from app.routers import data_process, data_upload, deep_learning, health, layers, project, training
+from app.routers import data_process, data_upload, deep_learning, export, health, layers, project, training
 from app.shared.logging_config import get_logger
 from app.socketio_instance import sio
 
@@ -32,10 +32,14 @@ logger = get_logger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Run Alembic migrations on startup, then yield control to the app."""
+    import asyncio
+
     from alembic import command
     from alembic.config import Config
     from alembic.runtime.migration import MigrationContext
     from alembic.script import ScriptDirectory
+
+    cleanup_task = None
 
     if os.environ.get("TESTING"):
         logger.info("TESTING mode — skipping Alembic migrations")
@@ -74,7 +78,33 @@ async def lifespan(app: FastAPI):
             orphan_recovery()
         except Exception as e:
             logger.error(f"Orphan recovery error: {e}")
+
+        # Start background cleanup task for old export files
+        async def _export_cleanup_loop():
+            from app.database import get_session
+            from app.services.model_export import cleanup_exports
+
+            while True:
+                await asyncio.sleep(6 * 3600)  # every 6 hours
+                try:
+                    retention_days = int(os.getenv("EXPORT_RETENTION_DAYS", "7"))
+                    with get_session() as session:
+                        count = cleanup_exports(retention_days, session)
+                    logger.info(f"Export cleanup: deleted {count} directories")
+                except Exception as e:
+                    logger.error(f"Export cleanup error: {e}")
+
+        cleanup_task = asyncio.create_task(_export_cleanup_loop())
+
     yield
+
+    # Cleanup on shutdown
+    if cleanup_task:
+        import contextlib
+
+        cleanup_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await cleanup_task
 
 
 app = FastAPI(title="TensorMap API", lifespan=lifespan)
@@ -86,6 +116,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
 )
 app.add_middleware(RequestLoggingMiddleware)
 app.add_middleware(RequestIDMiddleware)
@@ -105,6 +136,7 @@ app.include_router(deep_learning.router, prefix=settings.api_base)
 app.include_router(project.router, prefix=settings.api_base)
 app.include_router(layers.router, prefix=settings.api_base)
 app.include_router(training.router, prefix=settings.api_base)
+app.include_router(export.router, prefix=settings.api_base)
 
 # Wrap FastAPI with SocketIO so socket.io requests are handled,
 # and everything else passes through to FastAPI.

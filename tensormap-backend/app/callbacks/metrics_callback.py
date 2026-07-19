@@ -110,7 +110,20 @@ class MetricsCallback(tf.keras.callbacks.Callback):
         and still fires ``on_train_end``; guarding on the current status keeps us
         from overwriting CANCELLED/FAILED with COMPLETED. Emits a terminal status
         event so subscribers know the run is over.
+
+        Also saves the trained model to exports/{job_id}/model.keras for later export.
         """
+        from app.services.model_export import EXPORTS_BASE
+
+        # Save model to exports/{job_id}/model.keras
+        export_dir = EXPORTS_BASE / self.job_id
+        export_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.model.save(export_dir / "model.keras")
+            logger.info(f"Saved model.keras for job {self.job_id}")
+        except Exception as e:
+            logger.error(f"Failed to save model.keras for job {self.job_id}: {e}")
+
         final_status = None
         with self.session_factory() as session:
             job = session.get(TrainingJob, self.job_id)
