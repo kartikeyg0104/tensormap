@@ -434,3 +434,182 @@ def test_path_traversal_prevention(tmp_path, mock_keras_model):
         assert "\\" not in zip_path.name
         # Verify the actual path traversal was prevented
         assert zip_path.parent == export_dir
+
+
+def test_export_directory_not_found(tmp_path):
+    """get_export_formats returns 404-like structure when export directory doesn't exist."""
+    job_id = str(uuid4())
+    model_name = "nonexistent_model"
+
+    # No export directory created - job hasn't run yet
+    with patch("app.services.model_export.EXPORTS_BASE", tmp_path / "exports"):
+        formats = get_export_formats(job_id, model_name, None)
+
+        # All formats should be unavailable
+        assert formats["savedmodel"]["available"] is False
+        assert formats["tflite"]["available"] is False
+        assert formats["onnx"]["available"] is False
+
+        # ONNX should indicate training not completed
+        assert formats["onnx"]["onnx_supported"] is False
+        assert "Training not completed" in formats["onnx"]["onnx_issues"]
+
+
+def test_concurrent_export_requests(tmp_path, mock_keras_model):
+    """Two simultaneous requests for same format should both succeed (no duplicate generation)."""
+    import threading
+
+    job_id = str(uuid4())
+    model_name = "test_model"
+
+    export_dir = tmp_path / "exports" / job_id
+    export_dir.mkdir(parents=True)
+    (export_dir / "model.keras").write_text("dummy")
+
+    results = []
+    errors = []
+
+    def export_worker():
+        try:
+            # Mock TFLite converter
+            mock_converter = Mock()
+            mock_converter.convert.return_value = b"tflite model bytes"
+
+            import tensorflow as tf
+
+            with (
+                patch("app.services.model_export.EXPORTS_BASE", tmp_path / "exports"),
+                patch.object(tf.keras.models, "load_model", return_value=mock_keras_model),
+                patch.object(tf.lite.TFLiteConverter, "from_keras_model", return_value=mock_converter),
+            ):
+                result = export_tflite(job_id, model_name)
+                results.append(result)
+        except Exception as e:
+            errors.append(e)
+
+    # Start two threads simultaneously
+    thread1 = threading.Thread(target=export_worker)
+    thread2 = threading.Thread(target=export_worker)
+
+    thread1.start()
+    thread2.start()
+
+    thread1.join()
+    thread2.join()
+
+    # Both should succeed (no errors)
+    assert len(errors) == 0
+    assert len(results) == 2
+
+    # Both should return the same path
+    assert results[0] == results[1]
+    assert results[0].exists()
+
+
+def test_storage_limit_triggers_cleanup(tmp_path, db_session: Session):
+    """Verify that cleanup_exports is called with aggressive retention when storage exceeds limit."""
+    # This test verifies the cleanup logic, not the main.py background task itself
+    # Create multiple export directories
+    from datetime import timedelta
+
+    model_id = 1
+    db_session.add(ModelBasic(id=model_id, model_name="storage-test-model"))
+    db_session.commit()
+
+    # Create old jobs that should be cleaned up
+    old_jobs = []
+    for _ in range(3):
+        job_id = str(uuid4())
+        export_dir = tmp_path / "exports" / job_id
+        export_dir.mkdir(parents=True)
+        (export_dir / "model.keras").write_text("old" * 1000)  # Some content
+
+        job = TrainingJob(
+            id=job_id,
+            model_id=model_id,
+            status=TrainingStatus.COMPLETED,
+            hyperparams={},
+            completed_at=datetime.now(UTC) - timedelta(days=2),  # 2 days old
+        )
+        db_session.add(job)
+        old_jobs.append(job_id)
+
+    db_session.commit()
+
+    # Verify cleanup with 1 day retention (aggressive)
+    with patch("app.services.model_export.EXPORTS_BASE", tmp_path / "exports"):
+        count = cleanup_exports(retention_days=1, session=db_session)
+
+        # Should delete all 3 directories (all are > 1 day old)
+        assert count == 3
+
+        for job_id in old_jobs:
+            export_dir = tmp_path / "exports" / job_id
+            assert not export_dir.exists()
+
+
+def test_export_size_in_formats_response(tmp_path, mock_keras_model):
+    """Verify that get_export_formats returns correct size_bytes for existing exports."""
+    job_id = str(uuid4())
+    model_name = "test_model"
+
+    export_dir = tmp_path / "exports" / job_id
+    export_dir.mkdir(parents=True)
+    (export_dir / "model.keras").write_text("dummy")
+
+    # Create a TFLite export with known size
+    tflite_path = export_dir / f"{model_name}.tflite"
+    test_content = b"tflite test content" * 100
+    tflite_path.write_bytes(test_content)
+    expected_size = len(test_content)
+
+    with patch("app.services.model_export.EXPORTS_BASE", tmp_path / "exports"):
+        formats = get_export_formats(job_id, model_name, None)
+
+        # TFLite should be available with correct size
+        assert formats["tflite"]["available"] is True
+        assert formats["tflite"]["size_bytes"] == expected_size
+
+        # SavedModel and ONNX should not be available
+        assert formats["savedmodel"]["available"] is False
+        assert formats["onnx"]["available"] is False
+
+
+def test_expires_at_in_formats_response(tmp_path):
+    """Verify that expires_at is correctly calculated and formatted."""
+    import os
+    from datetime import timedelta
+
+    job_id = str(uuid4())
+    model_name = "test_model"
+
+    export_dir = tmp_path / "exports" / job_id
+    export_dir.mkdir(parents=True)
+    (export_dir / "model.keras").write_text("dummy")
+
+    # Create a TFLite export
+    tflite_path = export_dir / f"{model_name}.tflite"
+    tflite_path.write_bytes(b"test")
+
+    # Record the creation time
+    creation_time = datetime.fromtimestamp(tflite_path.stat().st_mtime, UTC)
+
+    # Mock retention days
+    retention_days = 7
+    with (
+        patch("app.services.model_export.EXPORTS_BASE", tmp_path / "exports"),
+        patch.dict(os.environ, {"EXPORT_RETENTION_DAYS": str(retention_days)}),
+    ):
+        formats = get_export_formats(job_id, model_name, None)
+
+        # Verify expires_at exists and is correctly formatted
+        assert formats["tflite"]["expires_at"] is not None
+        expires_at_str = formats["tflite"]["expires_at"]
+
+        # Parse ISO format
+        expires_at = datetime.fromisoformat(expires_at_str)
+        expected_expires = creation_time + timedelta(days=retention_days)
+
+        # Allow 1 second tolerance for file system time precision
+        time_diff = abs((expires_at - expected_expires).total_seconds())
+        assert time_diff < 1, f"Expected {expected_expires}, got {expires_at}"

@@ -39,7 +39,14 @@ class TrainingJob(SQLModel, table=True):
     __tablename__ = "training_job"
 
     id: str = Field(default_factory=lambda: str(uuid_pkg.uuid4()), primary_key=True)
-    model_id: int = Field(foreign_key="model_basic.id", index=True)
+    model_id: int = Field(
+        sa_column=Column(
+            "model_id",
+            ForeignKey("model_basic.id", ondelete="CASCADE"),
+            index=True,
+            nullable=False,
+        )
+    )
     # The project this job belongs to. TensorMap has no user/auth model, so jobs
     # are scoped to a project rather than an owner (no per-user authorization).
     project_id: uuid_pkg.UUID | None = Field(

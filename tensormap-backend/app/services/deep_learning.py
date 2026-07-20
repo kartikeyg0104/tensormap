@@ -642,6 +642,107 @@ def get_model_count_service(db: Session, project_id: uuid_pkg.UUID | None = None
     return _resp(200, True, "Model count retrieved", {"count": total})
 
 
+def get_model_architecture_service(db: Session, model_id: int, include_stats: bool = False) -> tuple:
+    """Get model architecture with optional statistics.
+
+    Args:
+        db: Database session
+        model_id: Model ID
+        include_stats: If True, compute parameter count and estimated size
+
+    Returns:
+        Tuple of (response_dict, status_code)
+    """
+    model = db.get(ModelBasic, model_id)
+    if not model:
+        return _resp(404, False, "Model not found")
+
+    response_data = {
+        "model_id": model.id,
+        "model_name": model.model_name,
+        "graph_ir": model.graph_ir,
+    }
+
+    if include_stats and model.graph_ir:
+        try:
+            # Estimate parameter count from graph_ir
+            param_count = _estimate_param_count(model.graph_ir)
+            # Estimate size: params * 4 bytes (float32) + overhead
+            size_mb = (param_count * 4) / (1024 * 1024)
+
+            response_data["param_count"] = param_count
+            response_data["size_mb"] = round(size_mb, 2)
+        except Exception as e:
+            logger.warning(f"Failed to compute model stats for model {model_id}: {e}")
+            # Return without stats rather than failing
+
+    return _resp(200, True, "Model architecture retrieved", response_data)
+
+
+def _estimate_param_count(graph_ir: dict) -> int:
+    """Estimate parameter count from graph IR.
+
+    This is a rough estimation based on layer types and configurations.
+    For accurate counts, the model would need to be built and model.count_params() called.
+    """
+    param_count = 0
+    nodes = graph_ir.get("nodes", [])
+
+    # Track previous layer output shape for Dense layers
+    prev_shape = None
+
+    for node in nodes:
+        node_params = node.get("node_params", {})
+        layer_type = node_params.get("layer_type", "").lower()
+
+        if layer_type == "input":
+            shape = node_params.get("shape", [])
+            if isinstance(shape, list) and len(shape) > 0:
+                # For input, store the last dimension
+                prev_shape = shape[-1] if shape[-1] is not None else 128  # default guess
+
+        elif layer_type == "dense":
+            units = node_params.get("units", 0)
+            if prev_shape is not None:
+                # weights: (prev_shape, units) + bias: (units,)
+                param_count += (prev_shape * units) + units
+            prev_shape = units
+
+        elif layer_type == "conv2d":
+            filters = node_params.get("filters", 0)
+            kernel_size = node_params.get("kernel_size", [3, 3])
+            if isinstance(kernel_size, int):
+                kernel_size = [kernel_size, kernel_size]
+            # Rough estimate: kernel_h * kernel_w * input_channels * filters + bias
+            # Assume 3 input channels for simplicity (or use prev_shape if known)
+            input_channels = 3 if prev_shape is None else prev_shape
+            param_count += (kernel_size[0] * kernel_size[1] * input_channels * filters) + filters
+            prev_shape = filters
+
+        elif layer_type == "lstm":
+            units = node_params.get("units", 0)
+            # LSTM has 4 gates, each with weights and recurrent weights
+            # Rough estimate: 4 * (input_dim * units + units * units + units)
+            input_dim = prev_shape if prev_shape is not None else 128
+            param_count += 4 * (input_dim * units + units * units + units)
+            prev_shape = units
+
+        elif layer_type == "gru":
+            units = node_params.get("units", 0)
+            # GRU has 3 gates
+            input_dim = prev_shape if prev_shape is not None else 128
+            param_count += 3 * (input_dim * units + units * units + units)
+            prev_shape = units
+
+        elif layer_type == "embedding":
+            input_dim = node_params.get("input_dim", 0)
+            output_dim = node_params.get("output_dim", 0)
+            param_count += input_dim * output_dim
+            prev_shape = output_dim
+
+    return param_count
+
+
 def get_training_history_service(
     db: Session, project_id: uuid_pkg.UUID | None = None, offset: int = 0, limit: int = 50
 ) -> tuple:
@@ -673,14 +774,18 @@ def get_training_history_service(
 
 
 def delete_model_service(db: Session, model_id: int) -> tuple:
-    """Delete a model and its associated ModelConfigs (cascade), and remove the JSON file."""
+    """Delete a model and its associated ModelConfigs (cascade), and remove the JSON file.
+
+    Also deletes all export directories for this model's training jobs.
+    Training jobs are automatically deleted via CASCADE DELETE on the FK constraint.
+    """
     model = db.get(ModelBasic, model_id)
     if not model:
         return _resp(404, False, "Model not found")
 
     model_name = model.model_name
 
-    # Delete all exports for this model's training jobs
+    # Delete all exports for this model's training jobs before cascade deletion
     try:
         from app.services.model_export import delete_model_exports
 
@@ -691,16 +796,17 @@ def delete_model_service(db: Session, model_id: int) -> tuple:
         logger.warning(f"Failed to delete exports for model {model_id}: {e}")
         # Continue with model deletion even if export cleanup fails
 
+    # Delete the model - CASCADE will automatically delete training_job and training_metric records
     try:
         db.delete(model)
         db.commit()
     except IntegrityError:
         db.rollback()
-        logger.exception("Failed to delete model id=%s", model_id)  # Issue #2: specific exception
+        logger.exception("Failed to delete model id=%s", model_id)
         return _resp(500, False, "Failed to delete model")
 
     # Best-effort removal of the JSON file — do not fail if already gone
-    model_path = _validate_model_path(model_name)  # Issue #1: path traversal guard
+    model_path = _validate_model_path(model_name)
     with contextlib.suppress(OSError):
         os.remove(model_path)
 

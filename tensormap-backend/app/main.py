@@ -22,7 +22,7 @@ from app.exceptions import (
     validation_exception_handler,
 )
 from app.middleware import RequestIDMiddleware, RequestLoggingMiddleware
-from app.routers import data_process, data_upload, deep_learning, export, health, layers, project, training
+from app.routers import analysis, data_process, data_upload, deep_learning, export, health, layers, project, training
 from app.shared.logging_config import get_logger
 from app.socketio_instance import sio
 
@@ -82,15 +82,32 @@ async def lifespan(app: FastAPI):
         # Start background cleanup task for old export files
         async def _export_cleanup_loop():
             from app.database import get_session
-            from app.services.model_export import cleanup_exports
+            from app.services.model_export import EXPORTS_BASE, cleanup_exports
 
             while True:
-                await asyncio.sleep(6 * 3600)  # every 6 hours
+                await asyncio.sleep(3600)  # hourly
                 try:
                     retention_days = int(os.getenv("EXPORT_RETENTION_DAYS", "7"))
-                    with get_session() as session:
-                        count = cleanup_exports(retention_days, session)
-                    logger.info(f"Export cleanup: deleted {count} directories")
+                    max_storage_gb = float(os.getenv("MAX_EXPORT_STORAGE_GB", "5.0"))
+
+                    # Check total storage usage
+                    if EXPORTS_BASE.exists():
+                        total_bytes = sum(f.stat().st_size for f in EXPORTS_BASE.rglob("*") if f.is_file())
+                        total_gb = total_bytes / (1024**3)
+                        logger.debug(f"Export storage usage: {total_gb:.2f} GB / {max_storage_gb} GB")
+
+                        # If over limit, use aggressive cleanup (1 day retention)
+                        if total_gb > max_storage_gb:
+                            logger.warning(f"Export storage limit exceeded ({total_gb:.2f} GB > {max_storage_gb} GB)")
+                            with get_session() as session:
+                                count = cleanup_exports(1, session)  # aggressive cleanup
+                            logger.info(f"Aggressive cleanup: deleted {count} directories")
+                        else:
+                            # Normal cleanup with configured retention
+                            with get_session() as session:
+                                count = cleanup_exports(retention_days, session)
+                            if count > 0:
+                                logger.info(f"Export cleanup: deleted {count} directories")
                 except Exception as e:
                     logger.error(f"Export cleanup error: {e}")
 
@@ -137,6 +154,7 @@ app.include_router(project.router, prefix=settings.api_base)
 app.include_router(layers.router, prefix=settings.api_base)
 app.include_router(training.router, prefix=settings.api_base)
 app.include_router(export.router, prefix=settings.api_base)
+app.include_router(analysis.router, prefix=settings.api_base)
 
 # Wrap FastAPI with SocketIO so socket.io requests are handled,
 # and everything else passes through to FastAPI.

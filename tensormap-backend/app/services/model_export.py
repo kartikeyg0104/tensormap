@@ -303,8 +303,11 @@ def get_export_formats(job_id: str, model_name: str, graph_ir: dict | None = Non
     return formats
 
 
-def _get_expiry_date(file_path: Path, retention_days: int = 7) -> str:
-    """Calculate expiry date for an export file."""
+def _get_expiry_date(file_path: Path) -> str:
+    """Calculate expiry date for an export file using configured retention."""
+    import os
+
+    retention_days = int(os.getenv("EXPORT_RETENTION_DAYS", "7"))
     mtime = datetime.fromtimestamp(file_path.stat().st_mtime, UTC)
     expires_at = mtime + timedelta(days=retention_days)
     return expires_at.isoformat()

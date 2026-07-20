@@ -61,6 +61,8 @@ def db_session(test_db_url: str) -> Generator[Session, None, None]:
     Yields:
         Session: SQLModel database session
     """
+    from sqlalchemy import event
+
     # Create engine with appropriate settings for SQLite vs PostgreSQL
     if test_db_url.startswith("sqlite"):
         engine = create_engine(
@@ -68,6 +70,14 @@ def db_session(test_db_url: str) -> Generator[Session, None, None]:
             connect_args={"check_same_thread": False},
             poolclass=StaticPool,
         )
+
+        # Enable foreign key constraints for SQLite
+        @event.listens_for(engine, "connect")
+        def set_sqlite_pragma(dbapi_conn, connection_record):
+            cursor = dbapi_conn.cursor()
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.close()
+
     else:
         engine = create_engine(test_db_url, echo=False)
 

@@ -1,6 +1,6 @@
 from datetime import UTC, datetime
 
-from sqlalchemy import Column, DateTime, Index
+from sqlalchemy import Column, DateTime, ForeignKey, Index, String
 from sqlmodel import Field, SQLModel
 
 
@@ -20,7 +20,15 @@ class TrainingMetric(SQLModel, table=True):
     __tablename__ = "training_metric"
 
     id: int | None = Field(default=None, primary_key=True)
-    job_id: str = Field(foreign_key="training_job.id", index=True)
+    job_id: str = Field(
+        sa_column=Column(
+            "job_id",
+            String(36),
+            ForeignKey("training_job.id", ondelete="CASCADE"),
+            index=True,
+            nullable=False,
+        )
+    )
     epoch: int
     metric_name: str = Field(max_length=50)  # "loss", "accuracy", "val_loss", "val_accuracy"
     metric_value: float

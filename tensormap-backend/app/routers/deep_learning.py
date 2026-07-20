@@ -13,6 +13,7 @@ from app.services.deep_learning import (
     delete_model_service,
     get_available_model_list,
     get_code_service,
+    get_model_architecture_service,
     get_model_count_service,
     get_model_graph_service,
     get_training_history_service,
@@ -147,4 +148,31 @@ def get_model_count(
 ):
     """Get the total count of saved models."""
     body, status_code = get_model_count_service(db, project_id=project_id)
+    return JSONResponse(status_code=status_code, content=body)
+
+
+@router.get("/model/architecture/{model_id}")
+def get_model_architecture(
+    model_id: int,
+    include_stats: bool = Query(False),
+    db: Session = Depends(get_db),
+):
+    """Retrieve model architecture details with optional parameter count.
+
+    Args:
+        model_id: Model ID
+        include_stats: If True, includes param_count and estimated size
+
+    Returns:
+        {
+            "success": true,
+            "model_id": int,
+            "model_name": str,
+            "graph_ir": dict,
+            "param_count": int (if include_stats=true),
+            "size_mb": float (if include_stats=true)
+        }
+    """
+    logger.debug("Fetching model architecture for model_id=%s, include_stats=%s", model_id, include_stats)
+    body, status_code = get_model_architecture_service(db, model_id=model_id, include_stats=include_stats)
     return JSONResponse(status_code=status_code, content=body)
