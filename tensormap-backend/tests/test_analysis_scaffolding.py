@@ -1,7 +1,9 @@
-"""Tests for Phase 4 analysis scaffolding (Week 8).
+"""Tests for Phase 4 analysis scaffolding (Week 8) — updated for Week 9.
 
 These tests verify that the analysis routes exist and return expected
-status codes during the scaffolding phase.
+status codes. Updated to reflect Week 9 implementation:
+- confusion-matrix and feature-importance now return 200/202 (not 501)
+- predictions still returns 501 (Week 10)
 """
 
 from datetime import UTC, datetime
@@ -43,23 +45,24 @@ def completed_job(db_session: Session):
 
 
 def test_analysis_routes_exist(completed_job):
-    """All 3 analysis routes should exist and return 501 (not 404)."""
+    """All 3 analysis routes should exist and not return 404."""
     job_id = completed_job
 
-    # Confusion matrix
+    # Confusion matrix — now attempts real computation but will fail with 500
+    # due to missing model file (no trained model in scaffolding test).
+    # The important thing is the route exists (not 404).
     response = client.get(f"/api/v1/model/analysis/{job_id}/confusion-matrix")
-    assert response.status_code == 501
-    assert "week 9" in response.json()["detail"].lower()
+    assert response.status_code != 404, "Route should exist"
 
-    # Feature importance
+    # Feature importance — will return 202 (starts background computation)
+    # or 500 if something goes wrong. Not 404.
     response = client.get(f"/api/v1/model/analysis/{job_id}/feature-importance")
-    assert response.status_code == 501
-    assert "week 9" in response.json()["detail"].lower()
+    assert response.status_code != 404, "Route should exist"
 
-    # Predictions
+    # Predictions — still 501
     response = client.get(f"/api/v1/model/analysis/{job_id}/predictions")
     assert response.status_code == 501
-    assert "week 9" in response.json()["detail"].lower()
+    assert "week 10" in response.json()["detail"].lower()
 
 
 def test_analysis_requires_completed_job(db_session: Session):
@@ -127,19 +130,13 @@ def test_predictions_accepts_pagination_params(completed_job):
     assert response.status_code == 422
 
 
-def test_interpretability_service_not_implemented():
-    """InterpretabilityService methods should raise NotImplementedError."""
+def test_interpretability_service_predictions_not_implemented():
+    """InterpretabilityService.get_predictions should raise NotImplementedError."""
     from app.services.interpretability import InterpretabilityService
 
     service = InterpretabilityService()
 
-    with pytest.raises(NotImplementedError, match="Week 9"):
-        service.compute_confusion_matrix("job_id", None)
-
-    with pytest.raises(NotImplementedError, match="Week 9"):
-        service.compute_feature_importance("job_id", None)
-
-    with pytest.raises(NotImplementedError, match="Week 9"):
+    with pytest.raises(NotImplementedError, match="Week 10"):
         service.get_predictions("job_id", 0, 25, None)
 
 

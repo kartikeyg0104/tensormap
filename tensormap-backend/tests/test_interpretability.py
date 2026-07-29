@@ -1,0 +1,570 @@
+"""Tests for Week 9 interpretability features.
+
+Tests cover:
+- Confusion matrix computation and caching (tests 1-8)
+- Feature importance with 202/200 polling and guardrails (tests 9-14)
+
+Uses test fixtures from tests/fixtures/create_test_model.py that create
+synthetic datasets and trained models without requiring the full data pipeline.
+"""
+
+import asyncio
+from datetime import UTC, datetime
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+from uuid import uuid4
+
+import numpy as np
+import pytest
+from fastapi.testclient import TestClient
+from sqlmodel import Session
+
+from app.main import app
+from app.models.ml import ModelBasic
+from app.models.training_job import TrainingJob, TrainingStatus
+from app.services.interpretability import AnalysisCache, InterpretabilityService
+from app.shared.enums import ProblemType
+from tests.fixtures.create_test_model import (
+    create_test_training_job,
+)
+
+client = TestClient(app)
+
+
+# ------------------------------------------------------------------
+# Fixtures
+# ------------------------------------------------------------------
+
+
+@pytest.fixture
+def export_dir(tmp_path):
+    """Provide a temporary export directory."""
+    return tmp_path / "exports"
+
+
+@pytest.fixture
+def trained_job(db_session: Session, export_dir: Path):
+    """Create a completed training job with a trained 3-class model."""
+    job_id, X_test, y_test, feature_names, model = create_test_training_job(
+        session=db_session,
+        export_dir=export_dir,
+        model_name="test_clf_model",
+        num_features=4,
+        num_classes=3,
+        epochs=5,
+    )
+    return {
+        "job_id": job_id,
+        "X_test": X_test,
+        "y_test": y_test,
+        "feature_names": feature_names,
+        "model": model,
+        "export_dir": export_dir,
+    }
+
+
+@pytest.fixture
+def regression_job(db_session: Session):
+    """Create a completed training job configured as regression."""
+    model = ModelBasic(
+        model_name="test_regression_model",
+        model_type=ProblemType.REGRESSION,
+        graph_ir={},
+    )
+    db_session.add(model)
+    db_session.commit()
+    db_session.refresh(model)
+
+    job_id = str(uuid4())
+    job = TrainingJob(
+        id=job_id,
+        model_id=model.id,
+        status=TrainingStatus.COMPLETED,
+        hyperparams={},
+        started_at=datetime.now(UTC),
+        completed_at=datetime.now(UTC),
+    )
+    db_session.add(job)
+    db_session.commit()
+
+    return job_id
+
+
+@pytest.fixture
+def pending_job(db_session: Session):
+    """Create a pending (not completed) training job."""
+    model = ModelBasic(model_name="test_pending_model", graph_ir={})
+    db_session.add(model)
+    db_session.commit()
+    db_session.refresh(model)
+
+    job_id = str(uuid4())
+    job = TrainingJob(
+        id=job_id,
+        model_id=model.id,
+        status=TrainingStatus.PENDING,
+        hyperparams={},
+    )
+    db_session.add(job)
+    db_session.commit()
+
+    return job_id
+
+
+# ------------------------------------------------------------------
+# Test 1: test_confusion_matrix_shape
+# ------------------------------------------------------------------
+
+
+@pytest.mark.slow
+def test_confusion_matrix_shape(trained_job, db_session):
+    """3-class classification → 3×3 confusion matrix."""
+    job_id = trained_job["job_id"]
+    X_test = trained_job["X_test"]
+    y_test = trained_job["y_test"]
+    class_names = [str(i) for i in range(3)]
+
+    service = InterpretabilityService()
+
+    # Mock _load_test_data to return our fixture data
+    with (
+        patch.object(
+            service,
+            "_load_test_data",
+            return_value=(X_test, y_test, class_names),
+        ),
+        patch(
+            "app.services.interpretability.EXPORTS_BASE",
+            trained_job["export_dir"],
+        ),
+    ):
+        result = service._compute_confusion_matrix_sync(job_id, db_session)
+
+    cm = result["confusion_matrix"]
+    assert len(cm) == 3, f"Expected 3 rows, got {len(cm)}"
+    for row in cm:
+        assert len(row) == 3, f"Expected 3 columns, got {len(row)}"
+    assert result["analysis_type"] == "classification"
+
+
+# ------------------------------------------------------------------
+# Test 2: test_confusion_matrix_cached_on_second_call
+# ------------------------------------------------------------------
+
+
+@pytest.mark.slow
+def test_confusion_matrix_cached_on_second_call(trained_job, db_session):
+    """Call twice, verify DB read on 2nd call (cache hit)."""
+    job_id = trained_job["job_id"]
+    X_test = trained_job["X_test"]
+    y_test = trained_job["y_test"]
+    class_names = [str(i) for i in range(3)]
+
+    service = InterpretabilityService()
+
+    with (
+        patch.object(
+            service,
+            "_load_test_data",
+            return_value=(X_test, y_test, class_names),
+        ),
+        patch(
+            "app.services.interpretability.EXPORTS_BASE",
+            trained_job["export_dir"],
+        ),
+    ):
+        # First call — should compute
+        result1 = asyncio.get_event_loop().run_until_complete(
+            service.compute_confusion_matrix_async(job_id, db_session)
+        )
+
+        # Second call — should hit cache (no _compute call)
+        with patch.object(service, "_compute_confusion_matrix_sync") as mock_compute:
+            result2 = asyncio.get_event_loop().run_until_complete(
+                service.compute_confusion_matrix_async(job_id, db_session)
+            )
+            mock_compute.assert_not_called()
+
+    assert result1["confusion_matrix"] == result2["confusion_matrix"]
+
+
+# ------------------------------------------------------------------
+# Test 3: test_classification_report_has_precision_recall
+# ------------------------------------------------------------------
+
+
+@pytest.mark.slow
+def test_classification_report_has_precision_recall(trained_job, db_session):
+    """Classification report has precision, recall, f1 for each class."""
+    job_id = trained_job["job_id"]
+    X_test = trained_job["X_test"]
+    y_test = trained_job["y_test"]
+    class_names = [str(i) for i in range(3)]
+
+    service = InterpretabilityService()
+
+    with (
+        patch.object(
+            service,
+            "_load_test_data",
+            return_value=(X_test, y_test, class_names),
+        ),
+        patch(
+            "app.services.interpretability.EXPORTS_BASE",
+            trained_job["export_dir"],
+        ),
+    ):
+        result = service._compute_confusion_matrix_sync(job_id, db_session)
+
+    report = result["classification_report"]
+
+    # Each class should have precision, recall, f1-score
+    for class_name in class_names:
+        assert class_name in report, f"Class {class_name} not in report"
+        assert "precision" in report[class_name]
+        assert "recall" in report[class_name]
+        assert "f1-score" in report[class_name]
+
+    # Averages should be present
+    assert "accuracy" in report
+    assert "macro avg" in report
+    assert "weighted avg" in report
+
+
+# ------------------------------------------------------------------
+# Test 4: test_regression_returns_residuals
+# ------------------------------------------------------------------
+
+
+@pytest.mark.slow
+def test_regression_returns_residuals(trained_job, db_session):
+    """Regression model → result has residuals array."""
+    job_id = trained_job["job_id"]
+    # Use the same model but pretend it's regression for testing
+    X_test = trained_job["X_test"]
+    y_test = trained_job["y_test"].astype(float)
+
+    service = InterpretabilityService()
+
+    with (
+        patch.object(
+            service,
+            "_load_test_data",
+            return_value=(X_test, y_test, []),
+        ),
+        patch(
+            "app.services.interpretability.EXPORTS_BASE",
+            trained_job["export_dir"],
+        ),
+    ):
+        result = service._compute_regression_analysis_sync(job_id, db_session)
+
+    assert "residuals" in result
+    assert "y_pred" in result
+    assert "y_true" in result
+    assert "mae" in result
+    assert "mse" in result
+    assert result["analysis_type"] == "regression"
+    assert len(result["residuals"]) == len(y_test)
+
+
+# ------------------------------------------------------------------
+# Test 5: test_confusion_matrix_not_available_for_regression
+# ------------------------------------------------------------------
+
+
+def test_confusion_matrix_not_available_for_regression(regression_job, db_session):
+    """Endpoint returns 400 for regression job."""
+    response = client.get(f"/api/v1/model/analysis/{regression_job}/confusion-matrix")
+    assert response.status_code == 400
+    assert "regression" in response.json()["detail"].lower()
+
+
+# ------------------------------------------------------------------
+# Test 6: test_get_confusion_matrix_endpoint_200
+# ------------------------------------------------------------------
+
+
+@pytest.mark.slow
+def test_get_confusion_matrix_endpoint_200(trained_job, db_session):
+    """GET /analysis/{job_id}/confusion-matrix → 200."""
+    job_id = trained_job["job_id"]
+    X_test = trained_job["X_test"]
+    y_test = trained_job["y_test"]
+    class_names = [str(i) for i in range(3)]
+
+    with (
+        patch.object(
+            InterpretabilityService,
+            "_load_test_data",
+            return_value=(X_test, y_test, class_names),
+        ),
+        patch(
+            "app.services.interpretability.EXPORTS_BASE",
+            trained_job["export_dir"],
+        ),
+    ):
+        response = client.get(f"/api/v1/model/analysis/{job_id}/confusion-matrix")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert "confusion_matrix" in data
+    assert "classification_report" in data
+    assert "overall_accuracy" in data
+    assert data["cached"] is False
+
+
+# ------------------------------------------------------------------
+# Test 7: test_get_confusion_matrix_endpoint_cached
+# ------------------------------------------------------------------
+
+
+@pytest.mark.slow
+def test_get_confusion_matrix_endpoint_cached(trained_job, db_session):
+    """Second request returns same data (from cache)."""
+    job_id = trained_job["job_id"]
+    X_test = trained_job["X_test"]
+    y_test = trained_job["y_test"]
+    class_names = [str(i) for i in range(3)]
+
+    with (
+        patch.object(
+            InterpretabilityService,
+            "_load_test_data",
+            return_value=(X_test, y_test, class_names),
+        ),
+        patch(
+            "app.services.interpretability.EXPORTS_BASE",
+            trained_job["export_dir"],
+        ),
+    ):
+        # First request — computes
+        response1 = client.get(f"/api/v1/model/analysis/{job_id}/confusion-matrix")
+        assert response1.status_code == 200
+        assert response1.json()["cached"] is False
+
+        # Second request — from cache
+        response2 = client.get(f"/api/v1/model/analysis/{job_id}/confusion-matrix")
+        assert response2.status_code == 200
+        assert response2.json()["cached"] is True
+
+    # Same confusion matrix data
+    assert response1.json()["confusion_matrix"] == response2.json()["confusion_matrix"]
+
+
+# ------------------------------------------------------------------
+# Test 8: test_analysis_requires_completed_job
+# ------------------------------------------------------------------
+
+
+def test_analysis_requires_completed_job(pending_job, db_session):
+    """Analysis on pending job → 400 'training not complete'."""
+    response = client.get(f"/api/v1/model/analysis/{pending_job}/confusion-matrix")
+    assert response.status_code == 400
+    assert "completed" in response.json()["detail"].lower()
+
+
+# ------------------------------------------------------------------
+# Test 9: test_feature_importance_returns_202_first
+# ------------------------------------------------------------------
+
+
+def test_feature_importance_returns_202_first(trained_job, db_session):
+    """First call → 202 with {status: 'computing'}."""
+    job_id = trained_job["job_id"]
+
+    # Mock the background task so it doesn't actually run
+    with patch("app.services.interpretability.asyncio.create_task"):
+        response = client.get(f"/api/v1/model/analysis/{job_id}/feature-importance")
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "computing"
+
+
+# ------------------------------------------------------------------
+# Test 10: test_feature_importance_returns_200_after_compute
+# ------------------------------------------------------------------
+
+
+@pytest.mark.slow
+def test_feature_importance_returns_200_after_compute(trained_job, db_session):
+    """After background task completes → 200 with data."""
+    job_id = trained_job["job_id"]
+    X_test = trained_job["X_test"]
+    feature_names = trained_job["feature_names"]
+
+    # Pre-populate cache as if background task completed
+    cache = AnalysisCache()
+    cached_result = {
+        "features": feature_names,
+        "importances_mean": [0.1, 0.2, 0.3, 0.05],
+        "importances_std": [0.01, 0.02, 0.03, 0.005],
+        "analysis_type": "feature_importance",
+        "n_samples_used": len(X_test),
+        "n_repeats": 10,
+    }
+    cache.set_cached(job_id, "feature_importance", cached_result, db_session)
+
+    response = client.get(f"/api/v1/model/analysis/{job_id}/feature-importance")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["analysis_type"] == "feature_importance"
+    assert "features" in data
+    assert "importances_mean" in data
+
+
+# ------------------------------------------------------------------
+# Test 11: test_feature_importance_capped_at_1000_samples
+# ------------------------------------------------------------------
+
+
+@pytest.mark.slow
+def test_feature_importance_capped_at_1000_samples(trained_job, db_session):
+    """Dataset with 2000 rows → result uses 1000."""
+    job_id = trained_job["job_id"]
+
+    # Create a large dataset (2000 samples, 4 features)
+    np.random.seed(42)
+    X_large = np.random.randn(2000, 4).astype(np.float32)
+    y_large = np.random.randint(0, 3, 2000)
+    feature_names = ["f0", "f1", "f2", "f3"]
+
+    # Create a mock Keras model that accepts any input shape
+    mock_model = MagicMock()
+    mock_model.predict = MagicMock(side_effect=lambda X, **kwargs: np.random.rand(len(X), 3).astype(np.float32))
+
+    service = InterpretabilityService()
+
+    with (
+        patch.object(
+            service,
+            "_load_test_data_with_features",
+            return_value=(X_large, y_large, feature_names),
+        ),
+        patch(
+            "app.services.interpretability.EXPORTS_BASE",
+            trained_job["export_dir"],
+        ),
+        patch(
+            "tensorflow.keras.models.load_model",
+            return_value=mock_model,
+        ),
+    ):
+        result = service._compute_feature_importance_sync(job_id, db_session)
+
+    assert result["n_samples_used"] == 1000
+
+
+# ------------------------------------------------------------------
+# Test 12: test_feature_importance_capped_at_20_features
+# ------------------------------------------------------------------
+
+
+@pytest.mark.slow
+def test_feature_importance_capped_at_20_features(db_session, export_dir):
+    """30-feature dataset → result has 20 features."""
+    # Create a model (only need DB records, actual model will be mocked)
+    job_id, X_test, y_test, feature_names, model = create_test_training_job(
+        session=db_session,
+        export_dir=export_dir,
+        model_name="test_30feat_model",
+        num_features=30,
+        num_classes=3,
+        epochs=3,
+    )
+
+    # Generate feature names for 30 features
+    feature_names_30 = [f"feature_{i}" for i in range(30)]
+
+    # Mock Keras model that handles any input shape
+    mock_model = MagicMock()
+    mock_model.predict = MagicMock(side_effect=lambda X, **kwargs: np.random.rand(len(X), 3).astype(np.float32))
+
+    service = InterpretabilityService()
+
+    with (
+        patch.object(
+            service,
+            "_load_test_data_with_features",
+            return_value=(X_test, y_test, feature_names_30),
+        ),
+        patch(
+            "app.services.interpretability.EXPORTS_BASE",
+            export_dir,
+        ),
+        patch(
+            "tensorflow.keras.models.load_model",
+            return_value=mock_model,
+        ),
+    ):
+        result = service._compute_feature_importance_sync(job_id, db_session)
+
+    assert len(result["features"]) == 20
+    assert len(result["importances_mean"]) == 20
+
+
+# ------------------------------------------------------------------
+# Test 13: test_feature_importance_cached_on_second_call
+# ------------------------------------------------------------------
+
+
+def test_feature_importance_cached_on_second_call(trained_job, db_session):
+    """Second 200 response uses cache."""
+    job_id = trained_job["job_id"]
+    feature_names = trained_job["feature_names"]
+
+    # Pre-populate cache
+    cache = AnalysisCache()
+    cached_result = {
+        "features": feature_names,
+        "importances_mean": [0.1, 0.2, 0.3, 0.05],
+        "importances_std": [0.01, 0.02, 0.03, 0.005],
+        "analysis_type": "feature_importance",
+        "n_samples_used": 30,
+        "n_repeats": 10,
+    }
+    cache.set_cached(job_id, "feature_importance", cached_result, db_session)
+
+    # Both calls should return 200 from cache
+    response1 = client.get(f"/api/v1/model/analysis/{job_id}/feature-importance")
+    response2 = client.get(f"/api/v1/model/analysis/{job_id}/feature-importance")
+
+    assert response1.status_code == 200
+    assert response2.status_code == 200
+    assert response1.json()["features"] == response2.json()["features"]
+
+
+# ------------------------------------------------------------------
+# Test 14: test_feature_importance_names_match_dataset
+# ------------------------------------------------------------------
+
+
+@pytest.mark.slow
+def test_feature_importance_names_match_dataset(trained_job, db_session):
+    """Feature names in result match dataset columns."""
+    job_id = trained_job["job_id"]
+    X_test = trained_job["X_test"]
+    y_test = trained_job["y_test"]
+    feature_names = trained_job["feature_names"]
+
+    service = InterpretabilityService()
+
+    with (
+        patch.object(
+            service,
+            "_load_test_data_with_features",
+            return_value=(X_test, y_test, feature_names),
+        ),
+        patch(
+            "app.services.interpretability.EXPORTS_BASE",
+            trained_job["export_dir"],
+        ),
+    ):
+        result = service._compute_feature_importance_sync(job_id, db_session)
+
+    # All returned feature names should be from the original dataset
+    for name in result["features"]:
+        assert name in feature_names, f"Feature {name} not in original dataset columns"
+
+    # Since we have 4 features (< 20 cap), all should be present
+    assert len(result["features"]) == len(feature_names)

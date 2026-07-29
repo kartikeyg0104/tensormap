@@ -21,6 +21,7 @@ dependencies = [
     "python-multipart>=0.0.9",
     "Werkzeug>=3.0",
     "tf2onnx>=1.16",
+    "scikit-learn>=1.4",
 ]
 
 [project.optional-dependencies]

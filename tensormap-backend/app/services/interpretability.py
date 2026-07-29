@@ -3,16 +3,30 @@
 This module provides cached analysis results for trained models including:
 - Confusion matrices and classification reports
 - Feature importance via permutation
-- Paginated predictions
+- Regression analysis (residuals, MAE, MSE)
 
-Full implementation in Week 9. Week 8 scaffolding only.
+Computations run via asyncio.to_thread to avoid blocking the event loop.
+Results are cached in training_job.analysis_cache JSON column.
 """
 
+import asyncio
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    mean_absolute_error,
+    mean_squared_error,
+)
 from sqlmodel import Session
 
 from app.shared.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+EXPORTS_BASE = Path("./exports")
 
 
 class AnalysisCache:
@@ -80,14 +94,153 @@ class AnalysisCache:
 class InterpretabilityService:
     """Computes interpretability analyses for trained models.
 
-    Placeholder implementations for Week 8. Full implementations in Week 9.
+    Supports classification (confusion matrix, classification report),
+    regression (residuals, MAE, MSE), and feature importance (permutation).
+    All heavy computations run in thread pools via asyncio.to_thread.
     """
 
     def __init__(self):
         self.cache = AnalysisCache()
 
-    def compute_confusion_matrix(self, job_id: str, session: Session) -> dict:
-        """Compute confusion matrix and classification report.
+    # ------------------------------------------------------------------
+    # Data loading helpers
+    # ------------------------------------------------------------------
+
+    def _load_test_data(self, job_id: str, session: Session) -> tuple[np.ndarray, np.ndarray, list[str]]:
+        """Loads test split of the dataset used for this training job.
+
+        Finds data_file via: training_job → model_basic → data_file
+        Applies same preprocessing that was used during training
+        (shuffle with random_state=42, split at training_split / 100).
+
+        Args:
+            job_id: Training job ID
+            session: Database session
+
+        Returns:
+            Tuple of (X_test, y_test, class_names)
+        """
+        from app.config import get_settings
+        from app.models.data import DataFile
+        from app.models.ml import ModelBasic
+        from app.models.training_job import TrainingJob
+
+        job = session.get(TrainingJob, job_id)
+        if not job:
+            raise ValueError(f"Training job not found: {job_id}")
+
+        model = session.get(ModelBasic, job.model_id)
+        if not model:
+            raise ValueError(f"Model not found for job: {job_id}")
+
+        if not model.file_id:
+            raise ValueError(f"No dataset linked to model {model.model_name}")
+
+        data_file = session.get(DataFile, model.file_id)
+        if not data_file:
+            raise ValueError(f"Data file not found for model {model.model_name}")
+
+        # Build file path (same logic as model_run._helper_generate_file_location)
+        upload_folder = get_settings().upload_folder
+        file_path = f"{upload_folder}/{data_file.disk_name}"
+
+        features = pd.read_csv(file_path)
+
+        target_field = model.target_field
+        if target_field not in features.columns:
+            raise ValueError(f"Target field '{target_field}' not found in dataset")
+
+        # Replicate exactly the same preprocessing as model_run._prepare_training_data
+        features = features.dropna()
+        features = features.sample(frac=1, random_state=42).reset_index(drop=True)
+
+        X = features.drop(target_field, axis=1)
+        y = features[target_field]
+
+        # Track original class names before encoding
+        if not pd.api.types.is_numeric_dtype(y):
+            class_names = list(pd.Categorical(y).categories)
+            y = pd.Categorical(y).codes
+        else:
+            class_names = [str(c) for c in sorted(y.unique())]
+
+        training_split = model.training_split if model.training_split else 80
+        split_index = int(len(X) * float(training_split) / 100)
+
+        X_test = X[split_index:].values.astype(np.float32)
+        y_test = y[split_index:].values if hasattr(y, "values") else y[split_index:]
+
+        return X_test, y_test, class_names
+
+    def _load_test_data_with_features(self, job_id: str, session: Session) -> tuple[np.ndarray, np.ndarray, list[str]]:
+        """Loads test split with feature names instead of class names.
+
+        Same data loading as _load_test_data but returns feature column names
+        for use with permutation feature importance.
+
+        Args:
+            job_id: Training job ID
+            session: Database session
+
+        Returns:
+            Tuple of (X_test, y_test, feature_names)
+        """
+        from app.config import get_settings
+        from app.models.data import DataFile
+        from app.models.ml import ModelBasic
+        from app.models.training_job import TrainingJob
+
+        job = session.get(TrainingJob, job_id)
+        if not job:
+            raise ValueError(f"Training job not found: {job_id}")
+
+        model = session.get(ModelBasic, job.model_id)
+        if not model:
+            raise ValueError(f"Model not found for job: {job_id}")
+
+        if not model.file_id:
+            raise ValueError(f"No dataset linked to model {model.model_name}")
+
+        data_file = session.get(DataFile, model.file_id)
+        if not data_file:
+            raise ValueError(f"Data file not found for model {model.model_name}")
+
+        upload_folder = get_settings().upload_folder
+        file_path = f"{upload_folder}/{data_file.disk_name}"
+
+        features = pd.read_csv(file_path)
+
+        target_field = model.target_field
+        if target_field not in features.columns:
+            raise ValueError(f"Target field '{target_field}' not found in dataset")
+
+        features = features.dropna()
+        features = features.sample(frac=1, random_state=42).reset_index(drop=True)
+
+        X = features.drop(target_field, axis=1)
+        y = features[target_field]
+
+        if not pd.api.types.is_numeric_dtype(y):
+            y = pd.Categorical(y).codes
+
+        feature_names = list(X.columns)
+
+        training_split = model.training_split if model.training_split else 80
+        split_index = int(len(X) * float(training_split) / 100)
+
+        X_test = X[split_index:].values.astype(np.float32)
+        y_test = y[split_index:].values if hasattr(y, "values") else y[split_index:]
+
+        return X_test, y_test, feature_names
+
+    # ------------------------------------------------------------------
+    # Confusion matrix + classification report
+    # ------------------------------------------------------------------
+
+    async def compute_confusion_matrix_async(self, job_id: str, session: Session) -> dict:
+        """Async wrapper — runs blocking sklearn computation in thread pool.
+
+        Returns cached result if available.
 
         Args:
             job_id: Training job ID
@@ -95,26 +248,255 @@ class InterpretabilityService:
 
         Returns:
             Dictionary with confusion matrix and classification metrics
-
-        Raises:
-            NotImplementedError: Placeholder for Week 9 implementation
         """
-        raise NotImplementedError("compute_confusion_matrix will be implemented in Week 9")
+        cache = self.cache.get_cached(job_id, "confusion_matrix", session)
+        if cache:
+            return cache
 
-    def compute_feature_importance(self, job_id: str, session: Session) -> dict:
-        """Compute permutation feature importance.
+        result = await asyncio.to_thread(self._compute_confusion_matrix_sync, job_id, session)
+        self.cache.set_cached(job_id, "confusion_matrix", result, session)
+        return result
+
+    def _compute_confusion_matrix_sync(self, job_id: str, session: Session) -> dict:
+        """Compute confusion matrix and classification report (blocking).
+
+        Loads the trained model from exports, runs predictions on the test split,
+        and computes sklearn metrics.
 
         Args:
             job_id: Training job ID
             session: Database session
 
         Returns:
-            Dictionary with feature importance scores
-
-        Raises:
-            NotImplementedError: Placeholder for Week 9 implementation
+            Dictionary with confusion_matrix, classification_report, class_names,
+            overall_accuracy, n_samples, and analysis_type
         """
-        raise NotImplementedError("compute_feature_importance will be implemented in Week 9")
+        import tensorflow as tf
+
+        model_path = EXPORTS_BASE / job_id / "model.keras"
+        model = tf.keras.models.load_model(model_path)
+
+        X_test, y_test, class_names = self._load_test_data(job_id, session)
+
+        y_pred = model.predict(X_test, verbose=0)
+        y_pred_classes = np.argmax(y_pred, axis=1)
+        y_true_classes = y_test if y_test.ndim == 1 else np.argmax(y_test, axis=1)
+
+        cm = confusion_matrix(y_true_classes, y_pred_classes)
+        report = classification_report(
+            y_true_classes,
+            y_pred_classes,
+            target_names=class_names,
+            output_dict=True,
+            zero_division=0,
+        )
+
+        return {
+            "confusion_matrix": cm.tolist(),
+            "classification_report": report,
+            "class_names": class_names,
+            "overall_accuracy": float(report["accuracy"]),
+            "n_samples": len(y_true_classes),
+            "analysis_type": "classification",
+        }
+
+    # ------------------------------------------------------------------
+    # Regression analysis
+    # ------------------------------------------------------------------
+
+    async def compute_regression_analysis_async(self, job_id: str, session: Session) -> dict:
+        """Async wrapper for regression analysis.
+
+        Returns cached result if available.
+
+        Args:
+            job_id: Training job ID
+            session: Database session
+
+        Returns:
+            Dictionary with residuals, predictions, actuals, MAE, MSE
+        """
+        cache = self.cache.get_cached(job_id, "regression_analysis", session)
+        if cache:
+            return cache
+
+        result = await asyncio.to_thread(self._compute_regression_analysis_sync, job_id, session)
+        self.cache.set_cached(job_id, "regression_analysis", result, session)
+        return result
+
+    def _compute_regression_analysis_sync(self, job_id: str, session: Session) -> dict:
+        """Compute regression analysis metrics (blocking).
+
+        Args:
+            job_id: Training job ID
+            session: Database session
+
+        Returns:
+            Dictionary with residuals, y_pred, y_true, mae, mse, analysis_type
+        """
+        import tensorflow as tf
+
+        model_path = EXPORTS_BASE / job_id / "model.keras"
+        model = tf.keras.models.load_model(model_path)
+
+        X_test, y_test, _ = self._load_test_data(job_id, session)
+
+        raw_pred = model.predict(X_test, verbose=0)
+        # For regression models the output is (n_samples, 1) → flatten to 1D.
+        # Guard against classification models used in regression context.
+        if raw_pred.ndim == 2 and raw_pred.shape[1] == 1:
+            y_pred = raw_pred.flatten()
+        elif raw_pred.ndim == 2:
+            # Multi-output: use first column as regression output
+            y_pred = raw_pred[:, 0]
+        else:
+            y_pred = raw_pred.flatten()
+
+        y_true = y_test.astype(float)
+        # Ensure shapes match
+        y_pred = y_pred[: len(y_true)]
+
+        residuals = (y_pred - y_true).tolist()
+        mae = float(mean_absolute_error(y_true, y_pred))
+        mse = float(mean_squared_error(y_true, y_pred))
+
+        return {
+            "residuals": residuals,
+            "y_pred": y_pred.tolist(),
+            "y_true": y_true.tolist(),
+            "mae": mae,
+            "mse": mse,
+            "analysis_type": "regression",
+        }
+
+    # ------------------------------------------------------------------
+    # Permutation feature importance (202 polling pattern)
+    # ------------------------------------------------------------------
+
+    async def compute_feature_importance_async(self, job_id: str, session: Session) -> dict | None:
+        """Returns None if computation is in progress (202 case).
+
+        Returns dict if cached.
+        Fires background asyncio.to_thread computation if not started.
+
+        Args:
+            job_id: Training job ID
+            session: Database session
+
+        Returns:
+            Feature importance dict if cached/computed, None if still computing
+        """
+        cache = self.cache.get_cached(job_id, "feature_importance", session)
+        if cache:
+            return cache
+
+        # Check if already computing (use a "computing" sentinel in cache)
+        sentinel = self.cache.get_cached(job_id, "feature_importance_status", session)
+        if sentinel and sentinel.get("status") == "computing":
+            return None  # Still computing → 202
+
+        # Mark as computing
+        self.cache.set_cached(job_id, "feature_importance_status", {"status": "computing"}, session)
+
+        # Fire background computation
+        asyncio.create_task(self._compute_and_cache_feature_importance(job_id, session))
+        return None  # Will be 202
+
+    async def _compute_and_cache_feature_importance(self, job_id: str, session: Session) -> None:
+        """Background task that computes feature importance and caches the result.
+
+        Args:
+            job_id: Training job ID
+            session: Database session
+        """
+        try:
+            result = await asyncio.to_thread(self._compute_feature_importance_sync, job_id, session)
+            self.cache.set_cached(job_id, "feature_importance", result, session)
+            # Clear the computing sentinel
+            self.cache.set_cached(job_id, "feature_importance_status", {"status": "completed"}, session)
+            logger.info(f"Feature importance computation completed for job {job_id}")
+        except Exception:
+            logger.exception(f"Feature importance computation failed for job {job_id}")
+            self.cache.set_cached(job_id, "feature_importance_status", {"status": "failed"}, session)
+
+    def _compute_feature_importance_sync(self, job_id: str, session: Session) -> dict:
+        """Compute permutation feature importance (blocking).
+
+        Guardrails:
+        - Sample capped at min(1000, len(X_test))
+        - Feature count capped at 20 (top by variance)
+
+        Args:
+            job_id: Training job ID
+            session: Database session
+
+        Returns:
+            Dictionary with features, importances_mean, importances_std,
+            n_samples_used, n_repeats, analysis_type
+        """
+        import tensorflow as tf
+        from sklearn.base import BaseEstimator, ClassifierMixin
+        from sklearn.inspection import permutation_importance
+
+        model_path = EXPORTS_BASE / job_id / "model.keras"
+        keras_model = tf.keras.models.load_model(model_path)
+
+        X_test, y_test, feature_names = self._load_test_data_with_features(job_id, session)
+
+        # Guardrails
+        MAX_SAMPLES = 1000
+        MAX_FEATURES = 20
+        n_samples = min(MAX_SAMPLES, len(X_test))
+        X_sample = X_test[:n_samples]
+        y_sample = y_test[:n_samples]
+
+        if X_sample.shape[1] > MAX_FEATURES:
+            # Select top 20 features by variance
+            variances = np.var(X_sample, axis=0)
+            top_indices = np.argsort(variances)[-MAX_FEATURES:]
+            top_indices = np.sort(top_indices)  # Keep original order
+            X_sample = X_sample[:, top_indices]
+            feature_names = [feature_names[i] for i in top_indices]
+
+        # Wrap Keras model in a sklearn-compatible estimator so
+        # permutation_importance can call .predict() and .score()
+        class _KerasEstimatorWrapper(BaseEstimator, ClassifierMixin):
+            """Minimal sklearn wrapper around a trained Keras model."""
+
+            def __init__(self, model):
+                self.model = model
+                self.classes_ = np.unique(y_sample)
+
+            def fit(self, X, y=None):
+                return self  # Already trained
+
+            def predict(self, X):
+                preds = self.model.predict(X, verbose=0)
+                return np.argmax(preds, axis=1)
+
+        estimator = _KerasEstimatorWrapper(keras_model)
+
+        result = permutation_importance(
+            estimator,
+            X_sample,
+            y_sample,
+            n_repeats=10,
+            random_state=42,
+            scoring="accuracy",
+        )
+
+        return {
+            "features": feature_names,
+            "importances_mean": result.importances_mean.tolist(),
+            "importances_std": result.importances_std.tolist(),
+            "analysis_type": "feature_importance",
+            "n_samples_used": n_samples,
+            "n_repeats": 10,
+        }
+
+    # ------------------------------------------------------------------
+    # Predictions (placeholder for Week 10)
+    # ------------------------------------------------------------------
 
     def get_predictions(self, job_id: str, offset: int, limit: int, session: Session) -> dict:
         """Get paginated predictions for test data.
@@ -129,6 +511,6 @@ class InterpretabilityService:
             Dictionary with predictions and pagination metadata
 
         Raises:
-            NotImplementedError: Placeholder for Week 9 implementation
+            NotImplementedError: Placeholder for Week 10 implementation
         """
-        raise NotImplementedError("get_predictions will be implemented in Week 9")
+        raise NotImplementedError("get_predictions will be implemented in Week 10")
