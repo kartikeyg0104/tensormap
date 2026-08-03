@@ -55,3 +55,24 @@ export interface RegressionAnalysisData {
   analysis_type: "regression";
   cached: boolean;
 }
+
+/** Single prediction record. */
+export interface Prediction {
+  index: number;
+  actual_class: number;
+  actual_class_name: string;
+  predicted_class: number;
+  predicted_class_name: string;
+  confidence: number;
+  probabilities: number[];
+  features: Record<string, number>;
+  is_correct: boolean;
+}
+
+/** Response from GET /analysis/{job_id}/predictions. */
+export interface PredictionsData {
+  total: number;
+  offset: number;
+  limit: number;
+  predictions: Prediction[];
+}
