@@ -189,44 +189,128 @@ async def get_predictions(
     job_id: str,
     offset: int = Query(0, ge=0),
     limit: int = Query(25, ge=1, le=100),
+    filter: str | None = Query(None, description="Filter: 'correct', 'incorrect', or null for all"),
     db: Session = Depends(get_db),
 ):
-    """Returns paginated predictions for test data.
+    """Returns paginated predictions for the prediction explorer.
+
+    Computes all predictions once and caches them. Subsequent calls serve
+    from cache, avoiding redundant model.predict() calls.
 
     Args:
         job_id: Training job ID
         offset: Pagination offset (default: 0)
         limit: Number of predictions to return (default: 25, max: 100)
+        filter: Filter by correctness:
+            - "correct": only correct predictions
+            - "incorrect": only incorrect predictions
+            - null: all predictions
 
     Returns:
         {
+            "total": 150,
+            "offset": 0,
+            "limit": 25,
             "predictions": [
                 {
-                    "index": int,
-                    "true_label": int,
-                    "predicted_label": int,
-                    "confidence": float,
-                    "correct": bool
+                    "index": 0,
+                    "actual_class": 0,
+                    "actual_class_name": "Setosa",
+                    "predicted_class": 0,
+                    "predicted_class_name": "Setosa",
+                    "confidence": 0.97,
+                    "probabilities": [0.97, 0.02, 0.01],
+                    "features": {"sepal_length": 5.1, ...},
+                    "is_correct": true
                 },
                 ...
-            ],
-            "total": int,
-            "offset": int,
-            "limit": int
+            ]
         }
 
     Status:
         - 200: Predictions available
-        - 400: Job not completed
+        - 400: Job not completed, invalid filter, or regression model
         - 404: Job not found
-        - 501: Not implemented (Week 10)
     """
     # Verify job exists and is completed
     _verify_job_completed(job_id, db)
 
-    # Week 10: Return 501 Not Implemented
-    logger.info(f"Predictions requested for job {job_id} (offset={offset}, limit={limit}) - not implemented yet")
-    raise HTTPException(
-        status_code=501,
-        detail="Predictions endpoint will be implemented in Week 10",
-    )
+    # Only available for classification models
+    analysis_type = get_analysis_type(job_id, db)
+    if analysis_type == "regression":
+        raise HTTPException(
+            status_code=400,
+            detail="Prediction explorer not available for regression models.",
+        )
+
+    # Validate filter parameter
+    filter_correct: bool | None = None
+    if filter == "correct":
+        filter_correct = True
+    elif filter == "incorrect":
+        filter_correct = False
+    elif filter is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid filter parameter. Must be 'correct', 'incorrect', or null.",
+        )
+
+    try:
+        result = _service.get_predictions_sync(job_id, offset, limit, filter_correct, db)
+    except (ValueError, FileNotFoundError, OSError) as exc:
+        logger.exception("Predictions computation failed for job %s", job_id)
+        raise HTTPException(status_code=500, detail=f"Predictions computation failed: {exc}") from exc
+
+    return JSONResponse(status_code=200, content=result)
+
+
+@router.get("/{job_id}/residuals")
+async def get_residuals(
+    job_id: str,
+    db: Session = Depends(get_db),
+):
+    """Returns residual plot data for regression models.
+
+    Args:
+        job_id: Training job ID
+
+    Returns:
+        {
+            "y_pred": [float, ...],
+            "y_true": [float, ...],
+            "residuals": [float, ...],
+            "mae": float,
+            "mse": float,
+            "analysis_type": "regression",
+            "cached": bool
+        }
+
+    Status:
+        - 200: Analysis available
+        - 400: Job not completed or not a regression model
+        - 404: Job not found
+    """
+    # Verify job exists and is completed
+    _verify_job_completed(job_id, db)
+
+    # Only available for regression models
+    analysis_type = get_analysis_type(job_id, db)
+    if analysis_type != "regression":
+        raise HTTPException(
+            status_code=400,
+            detail="Residual plot only available for regression models. Use /confusion-matrix for classification.",
+        )
+
+    # Check if result was already cached
+    cached = _service.cache.get_cached(job_id, "regression_analysis", db)
+    if cached:
+        return JSONResponse(status_code=200, content={**cached, "cached": True})
+
+    # Compute and cache
+    try:
+        result = await _service.compute_regression_analysis_async(job_id, db)
+    except (ValueError, FileNotFoundError, OSError) as exc:
+        logger.exception("Regression analysis computation failed for job %s", job_id)
+        raise HTTPException(status_code=500, detail=f"Analysis computation failed: {exc}") from exc
+
+    return JSONResponse(status_code=200, content={**result, "cached": False})

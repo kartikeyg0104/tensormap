@@ -1,9 +1,9 @@
-"""Tests for Phase 4 analysis scaffolding (Week 8) — updated for Week 9.
+"""Tests for Phase 4 analysis scaffolding (Week 8) — updated for Week 10.
 
 These tests verify that the analysis routes exist and return expected
-status codes. Updated to reflect Week 9 implementation:
-- confusion-matrix and feature-importance now return 200/202 (not 501)
-- predictions still returns 501 (Week 10)
+status codes. Updated to reflect Week 10 implementation:
+- confusion-matrix and feature-importance now return 200/202/500
+- predictions now returns 200/500 (Week 10 implementation complete)
 """
 
 from datetime import UTC, datetime
@@ -53,16 +53,16 @@ def test_analysis_routes_exist(completed_job):
     # The important thing is the route exists (not 404).
     response = client.get(f"/api/v1/model/analysis/{job_id}/confusion-matrix")
     assert response.status_code != 404, "Route should exist"
+    # Will be 500 because model file doesn't exist
 
     # Feature importance — will return 202 (starts background computation)
-    # or 500 if something goes wrong. Not 404.
     response = client.get(f"/api/v1/model/analysis/{job_id}/feature-importance")
     assert response.status_code != 404, "Route should exist"
 
-    # Predictions — still 501
+    # Predictions — now implemented (Week 10), will return 500 due to missing model file
     response = client.get(f"/api/v1/model/analysis/{job_id}/predictions")
-    assert response.status_code == 501
-    assert "week 10" in response.json()["detail"].lower()
+    assert response.status_code != 404, "Route should exist"
+    # Will be 500 because model file doesn't exist
 
 
 def test_analysis_requires_completed_job(db_session: Session):
@@ -116,13 +116,13 @@ def test_predictions_accepts_pagination_params(completed_job):
     """Predictions route should accept offset and limit query parameters."""
     job_id = completed_job
 
-    # Test with default params
+    # Test with default params - will return 500 because model file doesn't exist
     response = client.get(f"/api/v1/model/analysis/{job_id}/predictions")
-    assert response.status_code == 501  # Not implemented yet, but route exists
+    assert response.status_code == 500  # Implementation exists but no model file
 
-    # Test with custom params
+    # Test with custom params - will also return 500
     response = client.get(f"/api/v1/model/analysis/{job_id}/predictions?offset=10&limit=50")
-    assert response.status_code == 501
+    assert response.status_code == 500
 
     # Test with invalid params (limit too high)
     response = client.get(f"/api/v1/model/analysis/{job_id}/predictions?limit=200")
@@ -130,14 +130,15 @@ def test_predictions_accepts_pagination_params(completed_job):
     assert response.status_code == 422
 
 
-def test_interpretability_service_predictions_not_implemented():
-    """InterpretabilityService.get_predictions should raise NotImplementedError."""
+def test_interpretability_service_predictions_implemented():
+    """InterpretabilityService.get_predictions_sync should exist and be callable."""
     from app.services.interpretability import InterpretabilityService
 
     service = InterpretabilityService()
 
-    with pytest.raises(NotImplementedError, match="Week 10"):
-        service.get_predictions("job_id", 0, 25, None)
+    # Method should exist (Week 10 implementation)
+    assert hasattr(service, "get_predictions_sync")
+    assert callable(service.get_predictions_sync)
 
 
 def test_analysis_cache_operations(db_session: Session):

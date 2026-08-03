@@ -495,22 +495,129 @@ class InterpretabilityService:
         }
 
     # ------------------------------------------------------------------
-    # Predictions (placeholder for Week 10)
+    # Predictions explorer (Week 10)
     # ------------------------------------------------------------------
 
-    def get_predictions(self, job_id: str, offset: int, limit: int, session: Session) -> dict:
-        """Get paginated predictions for test data.
+    def get_predictions_sync(
+        self, job_id: str, offset: int, limit: int, filter_correct: bool | None, session: Session
+    ) -> dict:
+        """Returns paginated predictions for the prediction explorer.
+
+        Computes all predictions once and caches them. Subsequent calls
+        serve from cache. This avoids running model.predict() on every
+        page request.
 
         Args:
             job_id: Training job ID
-            offset: Pagination offset
-            limit: Number of predictions to return
+            offset: Pagination offset (0-indexed)
+            limit: Number of predictions to return per page
+            filter_correct: Filter by correctness
+                - True: only correct predictions
+                - False: only incorrect predictions
+                - None: all predictions
             session: Database session
 
         Returns:
-            Dictionary with predictions and pagination metadata
-
-        Raises:
-            NotImplementedError: Placeholder for Week 10 implementation
+            {
+                "total": 150,
+                "offset": 0,
+                "limit": 25,
+                "predictions": [
+                    {
+                        "index": 0,
+                        "actual_class": 0,
+                        "actual_class_name": "Setosa",
+                        "predicted_class": 0,
+                        "predicted_class_name": "Setosa",
+                        "confidence": 0.97,
+                        "probabilities": [0.97, 0.02, 0.01],
+                        "features": {"sepal_length": 5.1, "sepal_width": 3.5, ...},
+                        "is_correct": true
+                    },
+                    ...
+                ]
+            }
         """
-        raise NotImplementedError("get_predictions will be implemented in Week 10")
+        # Check cache first
+        cached = self.cache.get_cached(job_id, "predictions", session)
+        if not cached:
+            # Compute all predictions and cache
+            cached = self._compute_all_predictions_sync(job_id, session)
+            self.cache.set_cached(job_id, "predictions", cached, session)
+
+        # Filter
+        all_predictions = cached["predictions"]
+        if filter_correct is True:
+            filtered = [p for p in all_predictions if p["is_correct"]]
+        elif filter_correct is False:
+            filtered = [p for p in all_predictions if not p["is_correct"]]
+        else:
+            filtered = all_predictions
+
+        # Paginate
+        paginated = filtered[offset : offset + limit]
+
+        return {
+            "total": len(filtered),
+            "offset": offset,
+            "limit": limit,
+            "predictions": paginated,
+        }
+
+    def _compute_all_predictions_sync(self, job_id: str, session: Session) -> dict:
+        """Compute predictions for all test samples.
+
+        Args:
+            job_id: Training job ID
+            session: Database session
+
+        Returns:
+            Dictionary with all predictions (not paginated)
+        """
+        import tensorflow as tf
+
+        model_path = EXPORTS_BASE / job_id / "model.keras"
+        model = tf.keras.models.load_model(model_path)
+
+        # Load test data with both class names and feature names
+        X_test, y_test, class_names = self._load_test_data(job_id, session)
+        _, _, feature_names = self._load_test_data_with_features(job_id, session)
+
+        # Run predictions
+        y_pred_probs = model.predict(X_test, verbose=0)
+        y_pred_classes = np.argmax(y_pred_probs, axis=1)
+        y_true_classes = y_test if y_test.ndim == 1 else np.argmax(y_test, axis=1)
+
+        # Build prediction records
+        predictions = []
+        for i in range(len(X_test)):
+            actual_class = int(y_true_classes[i])
+            predicted_class = int(y_pred_classes[i])
+            probabilities = y_pred_probs[i].tolist()
+            confidence = float(max(probabilities))
+
+            # Build feature dict
+            features = {feature_names[j]: float(X_test[i][j]) for j in range(len(feature_names))}
+
+            predictions.append(
+                {
+                    "index": i,
+                    "actual_class": actual_class,
+                    "actual_class_name": class_names[actual_class]
+                    if actual_class < len(class_names)
+                    else str(actual_class),
+                    "predicted_class": predicted_class,
+                    "predicted_class_name": class_names[predicted_class]
+                    if predicted_class < len(class_names)
+                    else str(predicted_class),
+                    "confidence": confidence,
+                    "probabilities": probabilities,
+                    "features": features,
+                    "is_correct": actual_class == predicted_class,
+                }
+            )
+
+        # Sort by confidence DESC (most confident first)
+        predictions.sort(key=lambda p: p["confidence"], reverse=True)
+
+        return {"predictions": predictions}

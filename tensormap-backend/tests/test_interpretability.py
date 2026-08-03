@@ -568,3 +568,138 @@ def test_feature_importance_names_match_dataset(trained_job, db_session):
 
     # Since we have 4 features (< 20 cap), all should be present
     assert len(result["features"]) == len(feature_names)
+
+
+# ------------------------------------------------------------------
+# Week 10 Tests: Predictions Endpoint
+# ------------------------------------------------------------------
+
+
+# ------------------------------------------------------------------
+# Test 15: test_predictions_endpoint_pagination
+# ------------------------------------------------------------------
+
+
+@pytest.mark.slow
+def test_predictions_endpoint_pagination(trained_job, db_session):
+    """GET /predictions?offset=0&limit=5 → 5 predictions."""
+    job_id = trained_job["job_id"]
+    X_test = trained_job["X_test"]
+    y_test = trained_job["y_test"]
+    class_names = [str(i) for i in range(3)]
+    feature_names = trained_job["feature_names"]
+
+    with (
+        patch.object(
+            InterpretabilityService,
+            "_load_test_data",
+            return_value=(X_test, y_test, class_names),
+        ),
+        patch.object(
+            InterpretabilityService,
+            "_load_test_data_with_features",
+            return_value=(X_test, y_test, feature_names),
+        ),
+        patch(
+            "app.services.interpretability.EXPORTS_BASE",
+            trained_job["export_dir"],
+        ),
+    ):
+        response = client.get(
+            f"/api/v1/model/analysis/{job_id}/predictions",
+            params={"offset": 0, "limit": 5},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert "predictions" in data
+    assert len(data["predictions"]) <= 5  # May be fewer if test set < 5
+    assert data["offset"] == 0
+    assert data["limit"] == 5
+
+
+# ------------------------------------------------------------------
+# Test 16: test_predictions_endpoint_filter_correct
+# ------------------------------------------------------------------
+
+
+@pytest.mark.slow
+def test_predictions_endpoint_filter_correct(trained_job, db_session):
+    """GET /predictions?filter=correct → only is_correct=true rows."""
+    job_id = trained_job["job_id"]
+    X_test = trained_job["X_test"]
+    y_test = trained_job["y_test"]
+    class_names = [str(i) for i in range(3)]
+    feature_names = trained_job["feature_names"]
+
+    with (
+        patch.object(
+            InterpretabilityService,
+            "_load_test_data",
+            return_value=(X_test, y_test, class_names),
+        ),
+        patch.object(
+            InterpretabilityService,
+            "_load_test_data_with_features",
+            return_value=(X_test, y_test, feature_names),
+        ),
+        patch(
+            "app.services.interpretability.EXPORTS_BASE",
+            trained_job["export_dir"],
+        ),
+    ):
+        response = client.get(
+            f"/api/v1/model/analysis/{job_id}/predictions",
+            params={"filter": "correct", "limit": 100},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    # All returned predictions should be correct
+    for pred in data["predictions"]:
+        assert pred["is_correct"] is True
+
+
+# ------------------------------------------------------------------
+# Test 17: test_predictions_confidence_sorted_desc
+# ------------------------------------------------------------------
+
+
+@pytest.mark.slow
+def test_predictions_confidence_sorted_desc(trained_job, db_session):
+    """Predictions are sorted by confidence DESC by default."""
+    job_id = trained_job["job_id"]
+    X_test = trained_job["X_test"]
+    y_test = trained_job["y_test"]
+    class_names = [str(i) for i in range(3)]
+    feature_names = trained_job["feature_names"]
+
+    with (
+        patch.object(
+            InterpretabilityService,
+            "_load_test_data",
+            return_value=(X_test, y_test, class_names),
+        ),
+        patch.object(
+            InterpretabilityService,
+            "_load_test_data_with_features",
+            return_value=(X_test, y_test, feature_names),
+        ),
+        patch(
+            "app.services.interpretability.EXPORTS_BASE",
+            trained_job["export_dir"],
+        ),
+    ):
+        response = client.get(
+            f"/api/v1/model/analysis/{job_id}/predictions",
+            params={"limit": 100},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    predictions = data["predictions"]
+
+    if len(predictions) > 1:
+        # Verify descending order
+        confidences = [p["confidence"] for p in predictions]
+        assert confidences == sorted(confidences, reverse=True), "Predictions not sorted by confidence DESC"
