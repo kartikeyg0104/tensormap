@@ -131,14 +131,14 @@ def test_predictions_accepts_pagination_params(completed_job):
 
 
 def test_interpretability_service_predictions_implemented():
-    """InterpretabilityService.get_predictions_sync should exist and be callable."""
+    """InterpretabilityService.get_predictions_async should exist and be callable."""
     from app.services.interpretability import InterpretabilityService
 
     service = InterpretabilityService()
 
     # Method should exist (Week 10 implementation)
-    assert hasattr(service, "get_predictions_sync")
-    assert callable(service.get_predictions_sync)
+    assert hasattr(service, "get_predictions_async")
+    assert callable(service.get_predictions_async)
 
 
 def test_analysis_cache_operations(db_session: Session):

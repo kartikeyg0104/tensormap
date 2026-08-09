@@ -233,6 +233,73 @@ class InterpretabilityService:
 
         return X_test, y_test, feature_names
 
+    def _load_test_data_complete(
+        self, job_id: str, session: Session
+    ) -> tuple[np.ndarray, np.ndarray, list[str], list[str]]:
+        """Loads test split with both class names and feature names in a single pass.
+
+        Avoids duplicate CSV loading and preprocessing by returning all metadata
+        at once. Use this when you need both class_names and feature_names.
+
+        Args:
+            job_id: Training job ID
+            session: Database session
+
+        Returns:
+            Tuple of (X_test, y_test, class_names, feature_names)
+        """
+        from app.config import get_settings
+        from app.models.data import DataFile
+        from app.models.ml import ModelBasic
+        from app.models.training_job import TrainingJob
+
+        job = session.get(TrainingJob, job_id)
+        if not job:
+            raise ValueError(f"Training job not found: {job_id}")
+
+        model = session.get(ModelBasic, job.model_id)
+        if not model:
+            raise ValueError(f"Model not found for job: {job_id}")
+
+        if not model.file_id:
+            raise ValueError(f"No dataset linked to model {model.model_name}")
+
+        data_file = session.get(DataFile, model.file_id)
+        if not data_file:
+            raise ValueError(f"Data file not found for model {model.model_name}")
+
+        upload_folder = get_settings().upload_folder
+        file_path = f"{upload_folder}/{data_file.disk_name}"
+
+        features = pd.read_csv(file_path)
+
+        target_field = model.target_field
+        if target_field not in features.columns:
+            raise ValueError(f"Target field '{target_field}' not found in dataset")
+
+        features = features.dropna()
+        features = features.sample(frac=1, random_state=42).reset_index(drop=True)
+
+        X = features.drop(target_field, axis=1)
+        y = features[target_field]
+
+        # Track original class names before encoding
+        if not pd.api.types.is_numeric_dtype(y):
+            class_names = list(pd.Categorical(y).categories)
+            y = pd.Categorical(y).codes
+        else:
+            class_names = [str(c) for c in sorted(y.unique())]
+
+        feature_names = list(X.columns)
+
+        training_split = model.training_split if model.training_split else 80
+        split_index = int(len(X) * float(training_split) / 100)
+
+        X_test = X[split_index:].values.astype(np.float32)
+        y_test = y[split_index:].values if hasattr(y, "values") else y[split_index:]
+
+        return X_test, y_test, class_names, feature_names
+
     # ------------------------------------------------------------------
     # Confusion matrix + classification report
     # ------------------------------------------------------------------
@@ -498,7 +565,7 @@ class InterpretabilityService:
     # Predictions explorer (Week 10)
     # ------------------------------------------------------------------
 
-    def get_predictions_sync(
+    async def get_predictions_async(
         self, job_id: str, offset: int, limit: int, filter_correct: bool | None, session: Session
     ) -> dict:
         """Returns paginated predictions for the prediction explorer.
@@ -541,8 +608,8 @@ class InterpretabilityService:
         # Check cache first
         cached = self.cache.get_cached(job_id, "predictions", session)
         if not cached:
-            # Compute all predictions and cache
-            cached = self._compute_all_predictions_sync(job_id, session)
+            # Compute all predictions and cache (offload to thread pool)
+            cached = await asyncio.to_thread(self._compute_all_predictions_sync, job_id, session)
             self.cache.set_cached(job_id, "predictions", cached, session)
 
         # Filter
@@ -579,9 +646,8 @@ class InterpretabilityService:
         model_path = EXPORTS_BASE / job_id / "model.keras"
         model = tf.keras.models.load_model(model_path)
 
-        # Load test data with both class names and feature names
-        X_test, y_test, class_names = self._load_test_data(job_id, session)
-        _, _, feature_names = self._load_test_data_with_features(job_id, session)
+        # Load test data with both class names and feature names in a single pass
+        X_test, y_test, class_names, feature_names = self._load_test_data_complete(job_id, session)
 
         # Run predictions
         y_pred_probs = model.predict(X_test, verbose=0)

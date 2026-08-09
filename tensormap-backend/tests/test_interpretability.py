@@ -592,13 +592,8 @@ def test_predictions_endpoint_pagination(trained_job, db_session):
     with (
         patch.object(
             InterpretabilityService,
-            "_load_test_data",
-            return_value=(X_test, y_test, class_names),
-        ),
-        patch.object(
-            InterpretabilityService,
-            "_load_test_data_with_features",
-            return_value=(X_test, y_test, feature_names),
+            "_load_test_data_complete",
+            return_value=(X_test, y_test, class_names, feature_names),
         ),
         patch(
             "app.services.interpretability.EXPORTS_BASE",
@@ -635,13 +630,8 @@ def test_predictions_endpoint_filter_correct(trained_job, db_session):
     with (
         patch.object(
             InterpretabilityService,
-            "_load_test_data",
-            return_value=(X_test, y_test, class_names),
-        ),
-        patch.object(
-            InterpretabilityService,
-            "_load_test_data_with_features",
-            return_value=(X_test, y_test, feature_names),
+            "_load_test_data_complete",
+            return_value=(X_test, y_test, class_names, feature_names),
         ),
         patch(
             "app.services.interpretability.EXPORTS_BASE",
@@ -677,13 +667,8 @@ def test_predictions_confidence_sorted_desc(trained_job, db_session):
     with (
         patch.object(
             InterpretabilityService,
-            "_load_test_data",
-            return_value=(X_test, y_test, class_names),
-        ),
-        patch.object(
-            InterpretabilityService,
-            "_load_test_data_with_features",
-            return_value=(X_test, y_test, feature_names),
+            "_load_test_data_complete",
+            return_value=(X_test, y_test, class_names, feature_names),
         ),
         patch(
             "app.services.interpretability.EXPORTS_BASE",
@@ -703,3 +688,75 @@ def test_predictions_confidence_sorted_desc(trained_job, db_session):
         # Verify descending order
         confidences = [p["confidence"] for p in predictions]
         assert confidences == sorted(confidences, reverse=True), "Predictions not sorted by confidence DESC"
+
+
+# ------------------------------------------------------------------
+# Test 18: test_predictions_endpoint_invalid_filter
+# ------------------------------------------------------------------
+
+
+def test_predictions_endpoint_invalid_filter(db_session, export_dir):
+    """GET /predictions?filter=invalid → 400 Bad Request."""
+    # Create a new trained job with unique model name
+    job_id, X_test, y_test, feature_names, model = create_test_training_job(
+        session=db_session,
+        export_dir=export_dir,
+        model_name=f"test_invalid_filter_{uuid4().hex[:8]}",
+        num_features=4,
+        num_classes=3,
+        epochs=5,
+    )
+
+    response = client.get(
+        f"/api/v1/model/analysis/{job_id}/predictions",
+        params={"filter": "invalid"},
+    )
+
+    assert response.status_code == 400
+    data = response.json()
+    assert "Invalid filter parameter" in data["detail"]
+
+
+# ------------------------------------------------------------------
+# Test 19: test_predictions_endpoint_regression_job
+# ------------------------------------------------------------------
+
+
+def test_predictions_endpoint_regression_job(regression_job, db_session):
+    """GET /predictions on a regression job → 400 Bad Request."""
+    job_id = regression_job
+
+    response = client.get(
+        f"/api/v1/model/analysis/{job_id}/predictions",
+    )
+
+    assert response.status_code == 400
+    data = response.json()
+    assert "not available for regression" in data["detail"].lower()
+
+
+# ------------------------------------------------------------------
+# Test 20: test_residuals_endpoint_classification_job
+# ------------------------------------------------------------------
+
+
+@pytest.mark.slow
+def test_residuals_endpoint_classification_job(db_session, export_dir):
+    """GET /residuals on a classification job → 400 Bad Request."""
+    # Create a new trained job with unique model name
+    job_id, X_test, y_test, feature_names, model = create_test_training_job(
+        session=db_session,
+        export_dir=export_dir,
+        model_name=f"test_residuals_clf_{uuid4().hex[:8]}",
+        num_features=4,
+        num_classes=3,
+        epochs=5,
+    )
+
+    response = client.get(
+        f"/api/v1/model/analysis/{job_id}/residuals",
+    )
+
+    assert response.status_code == 400
+    data = response.json()
+    assert "only available for regression" in data["detail"].lower()

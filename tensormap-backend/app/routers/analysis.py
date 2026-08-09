@@ -189,7 +189,9 @@ async def get_predictions(
     job_id: str,
     offset: int = Query(0, ge=0),
     limit: int = Query(25, ge=1, le=100),
-    filter: str | None = Query(None, description="Filter: 'correct', 'incorrect', or null for all"),
+    filter_param: str | None = Query(
+        None, alias="filter", description="Filter: 'correct', 'incorrect', or null for all"
+    ),
     db: Session = Depends(get_db),
 ):
     """Returns paginated predictions for the prediction explorer.
@@ -245,18 +247,18 @@ async def get_predictions(
 
     # Validate filter parameter
     filter_correct: bool | None = None
-    if filter == "correct":
+    if filter_param == "correct":
         filter_correct = True
-    elif filter == "incorrect":
+    elif filter_param == "incorrect":
         filter_correct = False
-    elif filter is not None:
+    elif filter_param is not None:
         raise HTTPException(
             status_code=400,
             detail="Invalid filter parameter. Must be 'correct', 'incorrect', or null.",
         )
 
     try:
-        result = _service.get_predictions_sync(job_id, offset, limit, filter_correct, db)
+        result = await _service.get_predictions_async(job_id, offset, limit, filter_correct, db)
     except (ValueError, FileNotFoundError, OSError) as exc:
         logger.exception("Predictions computation failed for job %s", job_id)
         raise HTTPException(status_code=500, detail=f"Predictions computation failed: {exc}") from exc

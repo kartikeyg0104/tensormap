@@ -71,6 +71,11 @@ def test_phase4_full_analysis_workflow(db_session: Session, export_dir: Path):
             "_load_test_data_with_features",
             return_value=(X_test, y_test, feature_names),
         ),
+        patch.object(
+            InterpretabilityService,
+            "_load_test_data_complete",
+            return_value=(X_test, y_test, class_names, feature_names),
+        ),
         patch(
             "app.services.interpretability.EXPORTS_BASE",
             export_dir,
