@@ -10,6 +10,7 @@ from app.models.ml import ModelBasic, ModelConfigs  # noqa: F401
 from app.models.project import Project  # noqa: F401
 from app.models.training_job import TrainingJob  # noqa: F401
 from app.models.training_metric import TrainingMetric  # noqa: F401
+from app.models.tuning_session import TuningSession  # noqa: F401
 
 config = context.config
 

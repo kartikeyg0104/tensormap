@@ -22,7 +22,18 @@ from app.exceptions import (
     validation_exception_handler,
 )
 from app.middleware import RequestIDMiddleware, RequestLoggingMiddleware
-from app.routers import analysis, data_process, data_upload, deep_learning, export, health, layers, project, training
+from app.routers import (
+    analysis,
+    data_process,
+    data_upload,
+    deep_learning,
+    export,
+    health,
+    layers,
+    project,
+    training,
+    tuning,
+)
 from app.shared.logging_config import get_logger
 from app.socketio_instance import sio
 
@@ -155,6 +166,7 @@ app.include_router(layers.router, prefix=settings.api_base)
 app.include_router(training.router, prefix=settings.api_base)
 app.include_router(export.router, prefix=settings.api_base)
 app.include_router(analysis.router, prefix=settings.api_base)
+app.include_router(tuning.router, prefix=settings.api_base)
 
 # Wrap FastAPI with SocketIO so socket.io requests are handled,
 # and everything else passes through to FastAPI.
