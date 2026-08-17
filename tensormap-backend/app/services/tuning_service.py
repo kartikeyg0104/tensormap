@@ -359,6 +359,7 @@ class TuningService:
                     "type": "tuning_progress",
                     "trial": trial_num + 1,
                     "total": len(trials),
+                    "job_id": job_id,
                     "hyperparams": hyperparams,
                     "metric": final_metric,
                     "best_metric": best_metric,
